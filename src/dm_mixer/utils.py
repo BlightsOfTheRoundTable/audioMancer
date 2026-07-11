@@ -1,20 +1,21 @@
 import os
 import json
 
+# Permanent user profile folder workspace locations
 USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".dm_sound_mixer")
 USER_SOUNDS_DIR = os.path.join(USER_DATA_DIR, "custom_sounds")
 CONFIG_FILE = os.path.join(USER_DATA_DIR, "config.json")
 HISTORY_FILE = os.path.join(USER_DATA_DIR, "volume_history.json")
 
 def ensure_environment():
-    """Builds hidden home folders and fallback configurations automatically."""
+    """Builds hidden home folders and fallback configurations automatically on system boot."""
     os.makedirs(USER_SOUNDS_DIR, exist_ok=True)
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "w") as f:
             json.dump({}, f, indent=2)
 
 def load_keywords():
-    """Parses JSON data to build a flat dictionary with looping metadata."""
+    """Parses JSON data to build a flat dictionary with looping metadata mappings."""
     mapping = {}
     if not os.path.exists(CONFIG_FILE):
         return mapping
@@ -33,5 +34,5 @@ def load_keywords():
     return mapping
 
 def calculate_gains(base_volume, master_scale):
-    """Encapsulates relative volume trimming calculation math for safety validation."""
+    """Encapsulates relative volume trimming calculation math for safety validation operations."""
     return round(float(base_volume) * float(master_scale), 2)
