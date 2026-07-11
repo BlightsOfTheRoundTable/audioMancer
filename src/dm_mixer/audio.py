@@ -24,9 +24,11 @@ class AudioManager:
             except Exception as e:
                 print(f"⚠️ Could not load history file: {e}")
 
-    def play(self, keyword, file_info, on_ui_refresh_callback):
-        """Finds an open audio channel and loops or hits an asset file automatically."""
+    def play(self, keyword, file_info, on_ui_refresh_callback, root_window_widget):
+        """Finds an open audio channel. Loops atmospheres; tracks one-shots for their exact duration."""
         file_path = file_info["file_path"]
+        
+        # Prevent rolling phrase context updates from spamming duplicated sound effect clips
         if keyword in self.active_sounds or not os.path.exists(file_path):
             return False
             
@@ -42,9 +44,30 @@ class AudioManager:
             channel.set_volume(calculate_gains(target_base_volume, self.master_scale))
             
             if file_info["one_shot"]:
+                # Fire the effect exactly once
                 channel.play(sound, loops=0)
                 print(f"\n💥 ONE-SHOT EFFECT TRIGGERED: '{keyword}'")
+                
+                # Add to active soundscapes array to instantly gate rolling duplicate spams
+                self.active_sounds[keyword] = {
+                    "channel": channel, 
+                    "sound": sound, 
+                    "base_volume": target_base_volume,
+                    "slider_widget": None,
+                    "visual_bar_widget": None
+                }
+                on_ui_refresh_callback()
+                
+                # Calculate the sound's length in milliseconds (add 200ms safety padding buffer)
+                duration_ms = int(sound.get_length() * 1000) + 200
+                
+                # Schedule an automated self-clear event when the clip finishes playing through
+                root_window_widget.after(
+                    duration_ms, 
+                    lambda: self.auto_clear_expired_one_shot(keyword, on_ui_refresh_callback)
+                )
             else:
+                # Loop background ambient track infinitely
                 channel.play(sound, loops=-1)
                 self.active_sounds[keyword] = {
                     "channel": channel, 
@@ -55,9 +78,16 @@ class AudioManager:
                 }
                 on_ui_refresh_callback()
             return True
+            
         except Exception as e:
             print(f"\n❌ Error playing {file_path}: {e}")
             return False
+
+    def auto_clear_expired_one_shot(self, keyword, on_ui_refresh_callback):
+        """Silently clears an expired sound effect from the track rows without dropping active loop layers."""
+        if keyword in self.active_sounds:
+            del self.active_sounds[keyword]
+            on_ui_refresh_callback()
 
     def update_master_volume(self, val):
         self.master_scale = float(val) / 100.0
@@ -77,7 +107,6 @@ class AudioManager:
                 self.active_sounds[keyword]["visual_bar_widget"].config(value=scaled_percentage)
 
     def stop_track_with_gui_sync(self, keyword, callback, fade_ms=1000):
-        """Stops a single channel via UI click and saves its volume parameter."""
         if keyword in self.active_sounds:
             self.volume_history[keyword] = self.active_sounds[keyword]["base_volume"]
             try:
@@ -95,12 +124,8 @@ class AudioManager:
         return False
 
     def stop_all_sounds_with_fade(self, save_history_callback, fade_ms=3000):
-        """Commits mixing cache to file registry, clears screen layout, and drops audio gains."""
-        # 1. Update the local configuration dictionary cache
         for keyword, sound_data in self.active_sounds.items():
             self.volume_history[keyword] = sound_data["base_volume"]
-            
-        # 2. Write everything out cleanly to our physical home workspace json file
         try:
             with open(HISTORY_FILE, "w") as f:
                 json.dump(self.volume_history, f, indent=2)
@@ -108,21 +133,15 @@ class AudioManager:
         except Exception as e:
             print(f"❌ Error writing history file: {e}")
 
-        # 3. Create a local copy of our hardware channel connections before wiping memory references
         channels_to_fade = [data["channel"] for data in self.active_sounds.values()]
-        
-        # 4. WIPE THE MEMORY DICTIONARY BEFORE INVOKING THE REPAINT HANDLER
-        # This guarantees that app.py sees a completely blank dashboard registry list!
         self.active_sounds.clear()
         
-        # 5. Tell the main window UI layout tab to instantly erase the slider rows
         if save_history_callback:
             try:
                 save_history_callback()
             except Exception as e:
                 print(f"⚠️ UI layout refresh callback failed: {e}")
 
-        # 6. Smoothly drop our background channel audio levels to silence
         for channel in channels_to_fade:
             try:
                 if channel.get_busy():

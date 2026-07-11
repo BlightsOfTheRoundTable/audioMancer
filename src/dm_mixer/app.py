@@ -14,6 +14,11 @@ class DMSoundApplication:
         # 1. Initialize data folders and structural subsystems
         ensure_environment()
         self.audio_manager = AudioManager()
+                # FIX: App UI explicitly owns the recording state to prevent thread race conditions
+        self.is_recording = False
+        
+        # Initial run configuration sync load
+        self.sync_keyword_bank()
         
         # 2. Instantiate the Whisper thread engine with explicit cross-callbacks
         self.speech_engine = TranscriptionEngine(
@@ -101,15 +106,25 @@ class DMSoundApplication:
 
     def toggle_scene_state(self):
         """Manages the toggle tracking transitions of the microphone loop thread stream."""
-        if not self.speech_engine.is_running:
-            self.speech_engine.start(active_keyword_map=self.current_keywords)
+        if not self.is_recording:
+            # 1. Flip state immediately to lock out duplicate clicks
+            self.is_recording = True
+            
+            # 2. Arm and wake up the microphone listener
+            self.speech_engine.start(
+                active_keyword_map=self.current_keywords, 
+                root_window_widget=self.root
+            )
             self.action_btn.config(text="End Scene", bg="#d9534f", fg="white")
-            self.status_label.config(text=" Listening...", fg="#5cb85c")
+            self.status_label.config(text="🎤 Listening for Room Description...", fg="#5cb85c")
         else:
+            # 1. Flip state back to idle
+            self.is_recording = False
+            
             self.action_btn.config(text="Set the Scene", bg="#5cb85c", fg="white")
             self.status_label.config(text="System: Idle (Audio Fading & Saving)", fg="#aaaaaa")
             
-            # Hand over the frame display re-draw function directly
+            # 2. Stop speech processing and refresh sliders safely
             self.speech_engine.stop(save_history_callback=self.redraw_mixer_channels)
 
     def sync_keyword_bank(self):
