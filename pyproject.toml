@@ -1,4 +1,20 @@
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
+[project]
+name = "dm-mixer"
+version = "1.0.0"
+description = "A voice-activated automated audio mixer dashboard for Dungeon Masters."
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = [
+    "faster-whisper>=1.0.0",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0",
+    "pygame>=2.5.0",
+    "pytest>=9.1.1"
 ]
+
+[project.scripts]
+dm-mixer = "dm_mixer.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
