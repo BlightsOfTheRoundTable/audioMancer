@@ -1,6 +1,7 @@
 import os
 import json
 import pygame
+import time
 from dm_mixer.utils import calculate_gains, HISTORY_FILE
 
 class AudioManager:
@@ -13,9 +14,11 @@ class AudioManager:
         # Centralized volume configuration cache
         self.volume_history = {}
         self.load_history_from_disk()
+        
+        # Tracks active visual task timers to clear out ghost execution loops
+        self.one_shot_timers = {}
 
     def load_history_from_disk(self):
-        """Populates the local cache directly from the user profile folder on boot."""
         if os.path.exists(HISTORY_FILE) and os.path.getsize(HISTORY_FILE) > 0:
             try:
                 with open(HISTORY_FILE, "r") as f:
@@ -27,8 +30,6 @@ class AudioManager:
     def play(self, keyword, file_info, on_ui_refresh_callback, root_window_widget):
         """Finds an open audio channel. Loops atmospheres; tracks one-shots for their exact duration."""
         file_path = file_info["file_path"]
-        
-        # Prevent rolling phrase context updates from spamming duplicated sound effect clips
         if keyword in self.active_sounds or not os.path.exists(file_path):
             return False
             
@@ -39,46 +40,46 @@ class AudioManager:
                 print("\n⚠️ No free audio channels available!")
                 return False
                 
-            # Recover historical mix volume, fallback to 50%
             target_base_volume = self.volume_history.get(keyword, 0.5)
             channel.set_volume(calculate_gains(target_base_volume, self.master_scale))
             
+            # Capture track duration in absolute seconds
+            duration_seconds = sound.get_length()
+            start_time = time.time()
+            
             if file_info["one_shot"]:
-                # Fire the effect exactly once
+                # STRATEGY 1: Kill ghost timer on creation if a new voice trigger overrides it
+                if keyword in self.one_shot_timers:
+                    try:
+                        root_window_widget.after_cancel(self.one_shot_timers[keyword])
+                    except Exception:
+                        pass
+                
                 channel.play(sound, loops=0)
                 print(f"\n💥 ONE-SHOT EFFECT TRIGGERED: '{keyword}'")
                 
-                # Add to active soundscapes array to instantly gate rolling duplicate spams
                 self.active_sounds[keyword] = {
-                    "channel": channel, 
-                    "sound": sound, 
-                    "base_volume": target_base_volume,
-                    "slider_widget": None,
-                    "visual_bar_widget": None
+                    "channel": channel, "sound": sound, "base_volume": target_base_volume,
+                    "is_one_shot": True, "duration": duration_seconds, "start_time": start_time,
+                    "slider_widget": None, "visual_bar_widget": None, "canvas_widget": None
                 }
                 on_ui_refresh_callback()
                 
-                # Calculate the sound's length in milliseconds (add 200ms safety padding buffer)
-                duration_ms = int(sound.get_length() * 1000) + 200
-                
-                # Schedule an automated self-clear event when the clip finishes playing through
-                root_window_widget.after(
+                duration_ms = int(duration_seconds * 1000) + 200
+                task_id = root_window_widget.after(
                     duration_ms, 
                     lambda: self.auto_clear_expired_one_shot(keyword, on_ui_refresh_callback)
                 )
+                self.one_shot_timers[keyword] = task_id
             else:
-                # Loop background ambient track infinitely
                 channel.play(sound, loops=-1)
                 self.active_sounds[keyword] = {
-                    "channel": channel, 
-                    "sound": sound, 
-                    "base_volume": target_base_volume,
-                    "slider_widget": None,
-                    "visual_bar_widget": None
+                    "channel": channel, "sound": sound, "base_volume": target_base_volume,
+                    "is_one_shot": False, "duration": duration_seconds, "start_time": start_time,
+                    "slider_widget": None, "visual_bar_widget": None, "canvas_widget": None
                 }
                 on_ui_refresh_callback()
             return True
-            
         except Exception as e:
             print(f"\n❌ Error playing {file_path}: {e}")
             return False
@@ -87,7 +88,11 @@ class AudioManager:
         """Silently clears an expired sound effect from the track rows without dropping active loop layers."""
         if keyword in self.active_sounds:
             del self.active_sounds[keyword]
-            on_ui_refresh_callback()
+            
+        if keyword in self.one_shot_timers:
+            del self.one_shot_timers[keyword]
+            
+        on_ui_refresh_callback()
 
     def update_master_volume(self, val):
         self.master_scale = float(val) / 100.0
@@ -107,6 +112,7 @@ class AudioManager:
                 self.active_sounds[keyword]["visual_bar_widget"].config(value=scaled_percentage)
 
     def stop_track_with_gui_sync(self, keyword, callback, fade_ms=1000):
+        """Stops a single channel via UI click and explicitly destroys any lingering timers."""
         if keyword in self.active_sounds:
             self.volume_history[keyword] = self.active_sounds[keyword]["base_volume"]
             try:
@@ -114,6 +120,16 @@ class AudioManager:
                     json.dump(self.volume_history, f, indent=2)
             except Exception as e:
                 print(f"❌ Error updating track history: {e}")
+
+            # STRATEGY 2: If the user clicks '✕' to manually kill it, cancel the clock immediately
+            if keyword in self.one_shot_timers:
+                try:
+                    slider = self.active_sounds[keyword].get("slider_widget")
+                    if slider:
+                        slider.master.master.master.after_cancel(self.one_shot_timers[keyword])
+                except Exception:
+                    pass
+                del self.one_shot_timers[keyword]
 
             channel = self.active_sounds[keyword]["channel"]
             if channel.get_busy():
@@ -132,6 +148,9 @@ class AudioManager:
             print("\n💾 Track levels saved to system workspace profile.")
         except Exception as e:
             print(f"❌ Error writing history file: {e}")
+
+        # FIX: Wiped out the broken pygame video window call entirely to stabilize background threads
+        self.one_shot_timers.clear()
 
         channels_to_fade = [data["channel"] for data in self.active_sounds.values()]
         self.active_sounds.clear()
