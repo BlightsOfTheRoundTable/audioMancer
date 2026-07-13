@@ -107,18 +107,19 @@ class DMSoundApplication:
         for widget in self.list_frame.winfo_children():
             widget.destroy()
             
-        if not self.audio_manager.active_sounds:
+        # FIX: Wrap active_sounds in list() snapshot call to prevent thread size modification crashes
+        active_snapshot = list(self.audio_manager.active_sounds.items())
+            
+        if not active_snapshot:
             tk.Label(self.list_frame, text="No background layers active", fg="#777777", bg="#2d2d2d", font=("Arial", 10, "italic")).pack(pady=20)
             return
             
-        for keyword, sound_data in self.audio_manager.active_sounds.items():
+        for keyword, sound_data in active_snapshot:
             row = tk.Frame(self.list_frame, bg="#2d2d2d", pady=6)
             row.pack(fill="x", padx=10)
             
             tk.Label(row, text=f"  {keyword.capitalize()}", fg="#ffffff", bg="#2d2d2d", font=("Arial", 11), width=12, anchor="w").pack(side="left")
             
-            # --- NEW INTERPOLATED CANVAS CIRCLE OBJECT ASSEMBLY ---
-            # Creates a tiny black 20x20 window canvas block container
             canvas = tk.Canvas(row, width=20, height=20, bg="#2d2d2d", highlightthickness=0)
             canvas.pack(side="left", padx=(5, 5))
             sound_data["canvas_widget"] = canvas

@@ -5,6 +5,17 @@ import traceback  # FIX: Added for deep error inspection logging
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
+import random
+import time
+
+QUANTITY_MAP = {
+    "a": 1, "an": 1, "one": 1, "single": 1,
+    "two": 2, "couple": 2, "twin": 2, "double": 2,
+    "three": 3, "triple": 3, "several": 3, "multiple": 3,
+    "four": 4, "few": 4, "many": 5, "handful": 5,
+    "five": 5, "six": 6, "half-dozen": 6, "half dozen": 6,
+    "dozen": 12, "countless": 5, "barrage": 6, "volley": 5
+}
 
 class TranscriptionEngine:
     def __init__(self, audio_manager, on_keyword_triggered_callback):
@@ -82,61 +93,107 @@ class TranscriptionEngine:
         )
 
     def run_loop(self):
-        """The core continuous evaluation pipeline. Runs inside a background thread."""
+        """The core continuous evaluation pipeline with keyword temporal phrase lockout gates."""
         print("[DEBUG-SPEECH-THREAD] Background evaluation thread AWAKE and checking chunks.")
         audio_buffer = np.zeros(0, dtype=np.float32)
         
+        # FIX: Keep track of recently triggered keywords with absolute timestamps
+        phrase_cooldowns = {}
+        
         while self.is_running:
             try:
-                # Non-blocking check with timeout
                 try:
                     data = self.audio_queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 
                 audio_buffer = np.append(audio_buffer, data.ravel())
+                current_timestamp = time.time()
                 
-                # Check data block size bounds
                 if len(audio_buffer) >= self.sample_rate * 2:
-                    # Deep wrapper safety check directly around the Whisper engine parser
                     try:
                         segments, _ = self.model.transcribe(
-                            audio_buffer, 
-                            beam_size=3, 
-                            vad_filter=True, 
-                            language="en"
+                            audio_buffer, beam_size=3, vad_filter=True, language="en"
                         )
-                        
-                        # Forces execution out of generator state so we capture the true loop pass
                         segments = list(segments)
                     except Exception as e:
                         print(f"\n[ERROR-WHISPER-CORE] Model transcription crash: {e}")
-                        traceback.print_exc()
                         continue
                     
                     for segment in segments:
-                        clean_text = segment.text.lower().replace(".", "").replace(",", "").strip()
+                        clean_text = segment.text.lower().strip()
                         print(f"\r💬 Hearing description: {segment.text.strip()}", end="", flush=True)
                         
                         for keyword, file_info in self.keyword_mapping.items():
                             if keyword in clean_text:
+                                
+                                # FIX: Check if this precise keyword fired within the last 4 seconds.
+                                # If it did, completely skip it to block rolling sentence repetitions.
+                                if keyword in phrase_cooldowns:
+                                    if current_timestamp - phrase_cooldowns[keyword] < 4.0:
+                                        continue
+                                    else:
+                                        del phrase_cooldowns[keyword]
+                                
+                                # Arm the text lockout cache block timestamp immediately
+                                phrase_cooldowns[keyword] = current_timestamp
+                                
+                                fire_count = 1
+                                
+                                # --- UPGRADED FLEXIBLE SUB-STRING CONTEXT WINDOW ---
                                 try:
+                                    char_index = clean_text.find(keyword)
+                                    left_chunk = clean_text[max(0, char_index - 40):char_index].strip()
+                                    chunk_words = left_chunk.split()
+                                    context_words = chunk_words[-3:] if len(chunk_words) >= 3 else chunk_words
+                                    
+                                    for word in context_words:
+                                        word_clean = word.replace(".", "").replace(",", "").strip()
+                                        if word_clean in QUANTITY_MAP:
+                                            fire_count = QUANTITY_MAP[word_clean]
+                                            break
+                                        elif word_clean.isdigit():
+                                            fire_count = min(15, int(word_clean))
+                                            break
+                                except Exception as e:
+                                    print(f"\\n[DEBUG-BURST] Quantity fallback: {e}")
+
+                                # --- STAGGERED VOLLEY DISPATCHER WITH UNIQUE INSTANCE TAGGING ---
+                                if file_info["one_shot"] and fire_count > 1:
+                                    print(f"\\n⚡ MULTI-BURST VOLLEY RESOLVED: [{fire_count}x {keyword.upper()}]")
+                                    volley_id = str(int(time.time() * 100))[-3:]
+                                    
+                                    def dispatch_burst(total_shots, kw, info, callback, widget, group_id):
+                                        for shot in range(total_shots):
+                                            if shot == 0 and kw not in self.audio_manager.active_sounds:
+                                                unique_kw_id = kw
+                                            else:
+                                                unique_kw_id = f"{kw} #{shot + 1}-{group_id}"
+                                            
+                                            self.audio_manager.play(
+                                                keyword=unique_kw_id,
+                                                file_info=info,
+                                                on_ui_refresh_callback=callback,
+                                                root_window_widget=widget
+                                            )
+                                            time.sleep(random.uniform(0.15, 0.45))
+                                            
+                                    threading.Thread(
+                                        target=dispatch_burst, 
+                                        args=(fire_count, keyword, file_info, self.on_keyword_triggered_callback, self.root_window_widget, volley_id),
+                                        daemon=True
+                                    ).start()
+                                else:
                                     self.audio_manager.play(
                                         keyword=keyword,
                                         file_info=file_info,
                                         on_ui_refresh_callback=self.on_keyword_triggered_callback,
                                         root_window_widget=self.root_window_widget
                                     )
-                                except Exception as e:
-                                    print(f"\n[ERROR-PLAYBACK-BRIDGE] Failed passing event to audio manager: {e}")
-                                    traceback.print_exc()
                                 
                     if len(audio_buffer) >= self.sample_rate * 4:
                         audio_buffer = np.zeros(0, dtype=np.float32)
                         
             except Exception as e:
-                print(f"\n[CRITICAL-THREAD-FATAL] Unexpected error inside run_loop: {e}")
-                traceback.print_exc()
+                print(f"\\n[CRITICAL-THREAD-FATAL] Unexpected error inside run_loop: {e}")
                 break
-                
-        print("\n[DEBUG-SPEECH-THREAD] Background evaluation thread has TERMINATED.")
