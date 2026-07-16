@@ -287,6 +287,26 @@ def test_cancel_edit_state_resets_form(controller):
     assert controller.kw_entry.get() == ""
     assert controller.loop_var.get() is False
     assert controller.save_btn.cget("text") == "➕ Add Sound to Campaign Library"
+    assert controller.clear_btn.cget("text") == "✕ Clear"
+
+
+def test_load_asset_into_form_relabels_clear_button_to_cancel_edit(controller):
+    controller.load_asset_into_form("/library/rain.wav", ["rain"])
+
+    assert controller.clear_btn.cget("text") == "✕ Cancel Edit"
+
+
+def test_clear_button_unstages_a_picked_file_before_saving(controller, monkeypatch):
+    """The originally reported gap: browsing to a file with no way to back out of it
+    before saving. Clicking Clear (cancel_edit_state) must un-stage it."""
+    monkeypatch.setattr(studio_module.filedialog, "askopenfilename", lambda **kwargs: "/some/dir/rain.wav")
+    controller.browse()
+    assert controller.selected_file_path == "/some/dir/rain.wav"
+
+    controller.cancel_edit_state()
+
+    assert controller.selected_file_path is None
+    assert controller.file_label.cget("text") == "No Audio Track Picked..."
 
 
 # ---------------------------------------------------------------------------
