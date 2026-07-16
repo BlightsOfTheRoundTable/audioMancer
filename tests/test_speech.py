@@ -178,11 +178,10 @@ def test_unmatched_text_does_not_trigger_play(engine_factory):
         thread.join(timeout=2)
 
 
-def test_known_limitation_substring_match_has_false_positives(engine_factory):
-    """Documents current behavior rather than desired behavior: keyword matching is a plain
-    substring check, not word-boundary aware, so a short keyword can misfire inside an
-    unrelated larger word. If this test starts failing, matching has been improved to be
-    word-boundary aware and this test should be updated to reflect that."""
+def test_keyword_does_not_misfire_inside_an_unrelated_word(engine_factory):
+    """Regression test: keyword matching used to be a plain substring check, so "rat" fired
+    inside the unrelated word "narrate". Matching is now left-word-boundary aware, so this
+    must no longer trigger."""
     engine, audio_manager, model = engine_factory({
         "rat": {"file_path": "sounds/rat.wav", "one_shot": True},
     })
@@ -190,8 +189,26 @@ def test_known_limitation_substring_match_has_false_positives(engine_factory):
     thread = _run_and_stop(engine)
     try:
         _push_chunk(engine)
+        assert _wait_until(lambda: model.calls >= 1)
+        time.sleep(0.05)
+        assert audio_manager.play_calls == []
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
+
+def test_keyword_still_matches_a_spoken_plural_or_suffix(engine_factory):
+    """The left-boundary-only fix must not regress the common case of matching a keyword
+    spoken as a plural/suffixed form, e.g. "arrow" inside "arrows"."""
+    engine, audio_manager, model = engine_factory({
+        "arrow": {"file_path": "sounds/arrow.wav", "one_shot": True},
+    })
+    model.queue_response(["arrows rain down from above"])
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)
         assert _wait_until(lambda: len(audio_manager.play_calls) == 1)
-        assert audio_manager.play_calls[0]["keyword"] == "rat"
+        assert audio_manager.play_calls[0]["keyword"] == "arrow"
     finally:
         engine.is_running = False
         thread.join(timeout=2)
@@ -265,13 +282,11 @@ def test_quantity_phrase_fires_the_expected_number_of_bursts(engine_factory, mon
         thread.join(timeout=2)
 
 
-def test_known_limitation_leading_article_shadows_a_real_quantity_word(engine_factory, monkeypatch):
-    """Documents current behavior rather than desired behavior: the quantity scan reads the
-    last-3-words window left-to-right and stops at the FIRST match. "a dozen arrows" should
-    arguably fire 12 times, but "a" itself is also a mapped quantity word (=1) and appears
-    before "dozen" in the window, so it wins and the phrase fires only once. If this test
-    starts failing, the scan order has been fixed (e.g. to prefer the word closest to the
-    keyword) and this test should be updated to reflect that."""
+def test_leading_article_no_longer_shadows_a_real_quantity_word(engine_factory, monkeypatch):
+    """Regression test: the quantity scan used to read the last-3-words window left-to-right
+    and stop at the FIRST match, so "a dozen arrows" fired only once - "a" (itself mapped to
+    quantity 1) was hit before "dozen" was ever reached. The scan now reads right-to-left
+    (closest word to the keyword wins), so this must now fire the full 12 times."""
     engine, audio_manager, model = engine_factory({
         "arrow": {"file_path": "sounds/arrow.wav", "one_shot": True},
     })
@@ -281,9 +296,10 @@ def test_known_limitation_leading_article_shadows_a_real_quantity_word(engine_fa
     thread = _run_and_stop(engine)
     try:
         _push_chunk(engine)
-        assert _wait_until(lambda: len(audio_manager.play_calls) == 1)
-        time.sleep(0.1)
-        assert len(audio_manager.play_calls) == 1  # not 12, per the limitation above
+        assert _wait_until(lambda: len(audio_manager.play_calls) == 12, timeout=3.0)
+        assert audio_manager.play_calls[0]["keyword"] == "arrow"
+        for call in audio_manager.play_calls[1:]:
+            assert call["keyword"].startswith("arrow #")
     finally:
         engine.is_running = False
         thread.join(timeout=2)
@@ -297,6 +313,67 @@ def test_quantity_word_is_ignored_for_looping_keywords(engine_factory, monkeypat
     })
     monkeypatch.setattr(speech_module, "time", FakeTimeModule())
     model.queue_response(["three rain clouds gather overhead"])
+
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)
+        assert _wait_until(lambda: len(audio_manager.play_calls) == 1)
+        time.sleep(0.05)
+        assert len(audio_manager.play_calls) == 1
+        assert audio_manager.play_calls[0]["keyword"] == "rain"
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
+
+def test_repeated_mention_in_one_chunk_sums_to_a_single_combined_burst(engine_factory, monkeypatch):
+    """Regression test: a single transcribed chunk used to only look at the FIRST mention of
+    a keyword (re.search), so "two explosions ... and then two more explosions" fired only 2
+    total, silently dropping the second mention entirely. Scanning now finds every distinct
+    mention (re.finditer) and sums their quantities into one combined burst."""
+    engine, audio_manager, model = engine_factory({
+        "explosion": {"file_path": "sounds/explosion.wav", "one_shot": True},
+    })
+    monkeypatch.setattr(speech_module, "time", FakeTimeModule())
+    model.queue_response(["you hear two explosions and then two more explosions"])
+
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)
+        assert _wait_until(lambda: len(audio_manager.play_calls) == 4, timeout=3.0)
+        keywords = [call["keyword"] for call in audio_manager.play_calls]
+        assert keywords[0] == "explosion"
+        assert len(set(keywords)) == 4  # every shot got a unique key, no collisions
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
+
+def test_repeated_mention_with_different_quantities_sums_each_occurrence(engine_factory, monkeypatch):
+    """Each mention can carry its own quantity: "two" the first time, "three" the second."""
+    engine, audio_manager, model = engine_factory({
+        "explosion": {"file_path": "sounds/explosion.wav", "one_shot": True},
+    })
+    monkeypatch.setattr(speech_module, "time", FakeTimeModule())
+    model.queue_response(["two explosions rock the tower and then three more explosions follow"])
+
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)
+        assert _wait_until(lambda: len(audio_manager.play_calls) == 5, timeout=3.0)
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
+
+def test_repeated_mention_of_a_looping_keyword_still_starts_once(engine_factory, monkeypatch):
+    """Multiple mentions of a LOOPING keyword in one chunk shouldn't multiply anything -
+    a loop just needs to start once."""
+    engine, audio_manager, model = engine_factory({
+        "rain": {"file_path": "sounds/rain.wav", "one_shot": False},
+    })
+    monkeypatch.setattr(speech_module, "time", FakeTimeModule())
+    model.queue_response(["rain falls, and more rain follows, then even more rain"])
 
     thread = _run_and_stop(engine)
     try:

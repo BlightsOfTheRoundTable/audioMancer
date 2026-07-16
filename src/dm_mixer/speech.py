@@ -1,4 +1,5 @@
 import queue
+import re
 import sys
 import threading
 import random
@@ -114,7 +115,15 @@ class TranscriptionEngine:
                         print(f"\r💬 Hearing description: {segment.text.strip()}", end="", flush=True)
                         
                         for keyword, file_info in self.keyword_mapping.items():
-                            if keyword in clean_text:
+                            # Left boundary only (not \bkeyword\b): stops "rat" firing inside
+                            # "narrate", while still matching spoken plurals/suffixes like
+                            # "arrow" inside "arrows" or "goblin" inside "goblins".
+                            # finditer (not search): a single transcribed chunk can legitimately
+                            # contain more than one distinct mention of the same keyword (e.g.
+                            # "two explosions ... and then two more explosions") - matching only
+                            # the first would silently drop every later mention.
+                            matches = list(re.finditer(r'\b' + re.escape(keyword), clean_text))
+                            if matches:
                                 if keyword in phrase_cooldowns and current_timestamp - phrase_cooldowns[keyword] < 4.0:
                                     continue
                                 
@@ -146,22 +155,29 @@ class TranscriptionEngine:
                                     )
                                     continue
                                     
-                                fire_count = 1
-                                try:
-                                    char_index = clean_text.find(keyword)
-                                    left_chunk = clean_text[max(0, char_index - 40):char_index].strip()
-                                    chunk_words = left_chunk.split()
-                                    context_words = chunk_words[-3:] if len(chunk_words) >= 3 else chunk_words
-                                    
-                                    for word in context_words:
-                                        word_clean = word.replace(".", "").replace(",", "").strip()
-                                        if word_clean in QUANTITY_MAP:
-                                            fire_count = QUANTITY_MAP[word_clean]
-                                            break
-                                        elif word_clean.isdigit():
-                                            fire_count = min(15, int(word_clean))
-                                            break
-                                except Exception: pass
+                                # Sum quantities across every distinct mention of this keyword in
+                                # the chunk, so "two explosions ... two more explosions" fires 4
+                                # total rather than only counting the first mention.
+                                fire_count = 0
+                                for occurrence in matches:
+                                    occurrence_count = 1
+                                    try:
+                                        char_index = occurrence.start()
+                                        left_chunk = clean_text[max(0, char_index - 40):char_index].strip()
+                                        chunk_words = left_chunk.split()
+                                        context_words = chunk_words[-3:] if len(chunk_words) >= 3 else chunk_words
+
+                                        for word in reversed(context_words):
+                                            word_clean = word.replace(".", "").replace(",", "").strip()
+                                            if word_clean in QUANTITY_MAP:
+                                                occurrence_count = QUANTITY_MAP[word_clean]
+                                                break
+                                            elif word_clean.isdigit():
+                                                occurrence_count = min(15, int(word_clean))
+                                                break
+                                    except Exception: pass
+                                    fire_count += occurrence_count
+                                fire_count = min(15, fire_count)
 
                                 if file_info["one_shot"] and fire_count > 1:
                                     print(f"\n⚡ MULTI-BURST VOLLEY RESOLVED: [{fire_count}x {keyword.upper()}]")
