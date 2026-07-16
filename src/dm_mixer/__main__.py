@@ -1,8 +1,10 @@
 import sys
+from multiprocessing import freeze_support
 from dm_mixer.app import DMSoundApplication
 
 def main():
-    """Application package deployment script execution vector."""
+    # FIX: Lock process generation for Windows platforms
+    freeze_support()
     try:
         app = DMSoundApplication()
         app.run()

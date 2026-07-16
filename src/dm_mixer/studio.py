@@ -55,14 +55,22 @@ class SoundbankStudioController(tk.Frame):
         self.save_btn = tk.Button(self, text="➕ Add Sound to Campaign Library", font=("Arial", 11, "bold"), bg="#5cb85c", fg="white", activebackground="#4cae4c", relief="flat", padx=10, pady=4, command=self.save)
         self.save_btn.pack(pady=10)
 
-        # 2. TABULAR INVENTORY VIEW BLOCK
+                # =====================================================================
+        # 2. TABULAR INVENTORY VIEW BLOCK WITH NATIVE SCROLLBAR
+        # =====================================================================
         library_title = tk.Label(self, text="📜 CAMPAIGN SOUND LIBRARY INVENTORY", fg="#ffffff", bg="#1e1e1e", font=("Arial", 10, "bold"))
         library_title.pack(anchor="w", padx=25, pady=(10, 2))
 
+        # Core outer frame container to hold both the grid and its scrollbar side-by-side
         self.table_container = tk.Frame(self, bg="#1e1e1e")
         self.table_container.pack(fill="both", expand=True, padx=25, pady=(0, 15))
         
-        self.tree = ttk.Treeview(self.table_container, columns=("File", "Type", "Keywords"), show="headings", selectmode="none")
+        # Build a master sub-frame to isolate the tree and scrollbar from the right sidebar buttons
+        grid_frame = tk.Frame(self.table_container, bg="#1e1e1e")
+        grid_frame.pack(side="left", fill="both", expand=True)
+        
+        # Define the database grid columns
+        self.tree = ttk.Treeview(grid_frame, columns=("File", "Type", "Keywords"), show="headings", selectmode="none")
         self.tree.heading("File", text=" File Name", anchor="w")
         self.tree.heading("Type", text="Playback Type", anchor="center")
         self.tree.heading("Keywords", text=" Trigger Keywords", anchor="w")
@@ -70,8 +78,22 @@ class SoundbankStudioController(tk.Frame):
         self.tree.column("File", width=140, minwidth=100, anchor="w")
         self.tree.column("Type", width=90, minwidth=80, anchor="center")
         self.tree.column("Keywords", width=180, minwidth=120, anchor="w")
+        
+        # FIX: Create a native vertical scrollbar and mount it inside the grid frame
+        scrollbar = ttk.Scrollbar(grid_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack the components horizontally so the scrollbar sits tightly on the right edge
         self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
+        # FIX: Bind the standard mouse wheel events so you can scroll fluidly without touching the bar
+        def _on_mousewheel(event):
+            # Windows/macOS event handling multiplier support
+            self.tree.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.tree.bind("<MouseWheel>", _on_mousewheel)
+
+        # Right sidebar row container to stack your Edit (⚙️) and Delete (✕) button rows
         self.btn_sidebar = tk.Frame(self.table_container, bg="#1e1e1e")
         self.btn_sidebar.pack(side="right", fill="y", padx=(5, 0))
 
@@ -163,7 +185,7 @@ class SoundbankStudioController(tk.Frame):
             
         except Exception as e:
             messagebox.showerror("Save Failure", f"Could not process asset update request:\n{e}")
-            
+
     def update_library_inventory_gui(self):
         """Wipes and re-renders the clean data rows inside the matrix table grid."""
         for item in self.tree.get_children():
