@@ -1,22 +1,168 @@
 import os
 import json
+import platform
+import re
 import pygame
 import time
+import struct
+from multiprocessing import Process, Queue
 from dm_mixer.utils import calculate_gains, HISTORY_FILE
+
+def get_audio_file_duration(file_path):
+    """Extracts absolute playback length in seconds by walking the RIFF chunk table."""
+    try:
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".wav":
+            with open(file_path, 'rb') as f:
+                riff_id, _, wave_id = struct.unpack('<4sI4s', f.read(12))
+                if riff_id != b'RIFF' or wave_id != b'WAVE':
+                    return 3.0
+
+                channels = sample_rate = bits_per_sample = data_size = None
+                while True:
+                    header = f.read(8)
+                    if len(header) < 8:
+                        break
+                    chunk_id, chunk_size = struct.unpack('<4sI', header)
+
+                    if chunk_id == b'fmt ':
+                        fmt_data = f.read(chunk_size)
+                        channels = struct.unpack('<H', fmt_data[2:4])[0]
+                        sample_rate = struct.unpack('<I', fmt_data[4:8])[0]
+                        bits_per_sample = struct.unpack('<H', fmt_data[14:16])[0]
+                    elif chunk_id == b'data':
+                        data_size = chunk_size
+                        break
+                    else:
+                        # Skip unknown chunks (LIST/JUNK/etc), honoring word-alignment padding
+                        f.seek(chunk_size + (chunk_size % 2), 1)
+
+                if not all([channels, sample_rate, bits_per_sample, data_size]):
+                    return 3.0
+
+                duration = data_size / (sample_rate * channels * (bits_per_sample / 8))
+                return max(0.5, duration)
+        elif ext in [".mp3", ".ogg"]:
+            # Fallback estimation based on average bitrates if using compressed campaigns assets
+            file_size = os.path.getsize(file_path)
+            return max(1.0, (file_size * 8) / 128000) # Assumes standard 128kbps baseline
+    except Exception:
+        pass
+    return 3.0  # Production fallback guess if metadata headers are corrupted
+
+def _base_keyword(keyword):
+    """Strips periodic (' @ every Ns') and burst (' #N-id') suffixes back to the source keyword."""
+    base = keyword.split(" @")[0]
+    return re.sub(r" #\d+-\d+$", "", base)
+
+def pygame_worker_process(command_queue):
+    """A completely isolated hardware worker process running the Pygame mixer sandbox."""
+    if platform.system() == "Windows":
+        # DirectSound avoids exclusive-mode WASAPI collisions with the sounddevice mic stream.
+        # macOS (CoreAudio) and Linux don't have this collision, so let SDL pick its own default there.
+        os.environ['SDL_AUDIODRIVER'] = 'directsound'
+    try:
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+    except pygame.error:
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
+        
+    pygame.mixer.set_num_channels(16)
+    active_sounds = {}
+    master_scale = 1.0
+    
+    while True:
+        try:
+            cmd = command_queue.get()
+            if cmd is None:
+                for sound_data in active_sounds.values():
+                    sound_data["channel"].stop()
+                pygame.mixer.quit()
+                break
+
+            action = cmd.get("action")
+            
+            if action == "play":
+                kw = cmd["keyword"]
+                file_path = cmd["file_path"]
+                one_shot = cmd["one_shot"]
+                base_vol = cmd["base_volume"]
+                
+                if not os.path.exists(file_path):
+                    continue
+
+                existing = active_sounds.get(kw)
+                if existing and existing["channel"].get_busy():
+                    continue
+
+                try:
+                    sound = pygame.mixer.Sound(file_path)
+                    channel = pygame.mixer.find_channel()
+                    if channel:
+                        channel.set_volume(calculate_gains(base_vol, master_scale))
+                        if one_shot:
+                            channel.play(sound, loops=0)
+                        else:
+                            channel.play(sound, loops=-1)
+                        active_sounds[kw] = {"channel": channel, "sound": sound, "base_volume": base_vol}
+                except Exception as e:
+                    print(f"\n❌ Worker error playing {file_path}: {e}")
+                    
+            elif action == "update_master":
+                master_scale = cmd["value"]
+                for sound_data in active_sounds.values():
+                    scaled_vol = sound_data["base_volume"] * master_scale
+                    sound_data["channel"].set_volume(scaled_vol)
+                    
+            elif action == "update_individual":
+                kw = cmd["keyword"]
+                base_vol = cmd["value"]
+                if kw in active_sounds:
+                    active_sounds[kw]["base_volume"] = base_vol
+                    active_sounds[kw]["channel"].set_volume(base_vol * master_scale)
+                    
+            elif action == "stop_track":
+                kw = cmd["keyword"]
+                fade_ms = cmd["fade_ms"]
+                if kw in active_sounds:
+                    channel = active_sounds[kw]["channel"]
+                    if channel.get_busy():
+                        channel.fadeout(fade_ms)
+                    del active_sounds[kw]
+                    
+            elif action == "stop_all":
+                fade_ms = cmd["fade_ms"]
+                for sound_data in active_sounds.values():
+                    if sound_data["channel"].get_busy():
+                        sound_data["channel"].fadeout(fade_ms)
+                active_sounds.clear()
+                
+        except Exception:
+            pass
 
 class AudioManager:
     def __init__(self):
-        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
-        pygame.mixer.set_num_channels(16)
         self.active_sounds = {}
         self.master_scale = 1.0
+        self.one_shot_timers = {}
+        self.periodic_loops = {}
         
-        # Centralized volume configuration cache
         self.volume_history = {}
         self.load_history_from_disk()
         
-        # Tracks active visual task timers to clear out ghost execution loops
-        self.one_shot_timers = {}
+        self.command_queue = Queue()
+        self.worker = Process(target=pygame_worker_process, args=(self.command_queue,), daemon=True)
+        self.worker.start()
+        print("🔊 AudioManager Sandboxed Worker Process spawned successfully.")
+
+    def shutdown(self):
+        """Gracefully stops the sandboxed worker process on application exit."""
+        try:
+            self.command_queue.put(None)
+        except Exception:
+            pass
+        self.worker.join(timeout=2)
+        if self.worker.is_alive():
+            self.worker.terminate()
 
     def load_history_from_disk(self):
         if os.path.exists(HISTORY_FILE) and os.path.getsize(HISTORY_FILE) > 0:
@@ -27,113 +173,90 @@ class AudioManager:
             except Exception as e:
                 print(f"⚠️ Could not load history file: {e}")
 
-    def play(self, keyword, file_info, on_ui_refresh_callback, root_window_widget):
-        """Finds an open audio channel. Loops atmospheres; tracks one-shots for their exact duration."""
+    def play(self, keyword, file_info, on_ui_refresh_callback, root_window_widget, periodic_interval=None):
+        """Dispatches non-blocking IPC commands to the sandboxed audio hardware worker process."""
         file_path = file_info["file_path"]
         if keyword in self.active_sounds or not os.path.exists(file_path):
             return False
             
-        try:
-            sound = pygame.mixer.Sound(file_path)
-            channel = pygame.mixer.find_channel()
-            if not channel:
-                print("\n⚠️ No free audio channels available!")
-                return False
-                
-            target_base_volume = self.volume_history.get(keyword, 0.5)
-            channel.set_volume(calculate_gains(target_base_volume, self.master_scale))
-            
-            # Capture track duration in absolute seconds
-            duration_seconds = sound.get_length()
-            start_time = time.time()
-            
-            if file_info["one_shot"]:
-                # STRATEGY 1: Kill ghost timer on creation if a new voice trigger overrides it
-                if keyword in self.one_shot_timers:
-                    try:
-                        root_window_widget.after_cancel(self.one_shot_timers[keyword])
-                    except Exception:
-                        pass
-                
-                channel.play(sound, loops=0)
-                print(f"\n💥 ONE-SHOT EFFECT TRIGGERED: '{keyword}'")
-                
-                self.active_sounds[keyword] = {
-                    "channel": channel, "sound": sound, "base_volume": target_base_volume,
-                    "is_one_shot": True, "duration": duration_seconds, "start_time": start_time,
-                    "slider_widget": None, "visual_bar_widget": None, "canvas_widget": None
-                }
-                on_ui_refresh_callback()
-                
-                duration_ms = int(duration_seconds * 1000) + 200
-                task_id = root_window_widget.after(
-                    duration_ms, 
-                    lambda: self.auto_clear_expired_one_shot(keyword, on_ui_refresh_callback)
-                )
-                self.one_shot_timers[keyword] = task_id
-            else:
-                channel.play(sound, loops=-1)
-                self.active_sounds[keyword] = {
-                    "channel": channel, "sound": sound, "base_volume": target_base_volume,
-                    "is_one_shot": False, "duration": duration_seconds, "start_time": start_time,
-                    "slider_widget": None, "visual_bar_widget": None, "canvas_widget": None
-                }
-                on_ui_refresh_callback()
+        target_base_volume = self.volume_history.get(_base_keyword(keyword), 0.5)
+        
+        # FIX: Extract duration via high-performance structural binary scraping instead of Pygame init!
+        duration_seconds = get_audio_file_duration(file_path) if periodic_interval is None else periodic_interval
+        start_time = time.time()
+        
+        if periodic_interval is not None:
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": target_base_volume})
+            self.active_sounds[keyword] = {"base_volume": target_base_volume, "is_one_shot": False, "is_periodic": True, "duration": periodic_interval, "start_time": start_time}
+            on_ui_refresh_callback()
+            self.schedule_next_periodic_pass(keyword, file_info, periodic_interval, on_ui_refresh_callback, root_window_widget)
             return True
-        except Exception as e:
-            print(f"\n❌ Error playing {file_path}: {e}")
-            return False
+            
+        if file_info["one_shot"]:
+            if keyword in self.one_shot_timers:
+                try: root_window_widget.after_cancel(self.one_shot_timers[keyword])
+                except Exception: pass
+            
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": target_base_volume})
+            self.active_sounds[keyword] = {"base_volume": target_base_volume, "is_one_shot": True, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
+            on_ui_refresh_callback()
+            
+            duration_ms = int(duration_seconds * 1000) + 200
+            task_id = root_window_widget.after(duration_ms, lambda: self.auto_clear_expired_one_shot(keyword, on_ui_refresh_callback))
+            self.one_shot_timers[keyword] = task_id
+        else:
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": False, "base_volume": target_base_volume})
+            self.active_sounds[keyword] = {"base_volume": target_base_volume, "is_one_shot": False, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
+            on_ui_refresh_callback()
+        return True
+
+    def schedule_next_periodic_pass(self, keyword, file_info, interval, callback, root):
+        if keyword not in self.active_sounds: return
+        interval_ms = int(interval * 1000)
+        task_id = root.after(interval_ms, lambda: self.execute_periodic_fire(keyword, file_info, interval, callback, root))
+        self.periodic_loops[keyword] = task_id
+
+    def execute_periodic_fire(self, keyword, file_info, interval, callback, root):
+        if keyword not in self.active_sounds: return
+        if os.path.exists(file_info["file_path"]):
+            current_slider_vol = self.active_sounds[keyword]["base_volume"]
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_info["file_path"], "one_shot": True, "base_volume": current_slider_vol})
+            self.active_sounds[keyword]["start_time"] = time.time()
+        self.schedule_next_periodic_pass(keyword, file_info, interval, callback, root)
 
     def auto_clear_expired_one_shot(self, keyword, on_ui_refresh_callback):
-        """Silently clears an expired sound effect from the track rows without dropping active loop layers."""
-        if keyword in self.active_sounds:
-            del self.active_sounds[keyword]
-            
-        if keyword in self.one_shot_timers:
-            del self.one_shot_timers[keyword]
-            
+        if keyword in self.active_sounds: del self.active_sounds[keyword]
+        if keyword in self.one_shot_timers: del self.one_shot_timers[keyword]
         on_ui_refresh_callback()
 
     def update_master_volume(self, val):
         self.master_scale = float(val) / 100.0
-        for keyword, sound_data in self.active_sounds.items():
-            scaled_vol = sound_data["base_volume"] * self.master_scale
-            sound_data["channel"].set_volume(scaled_vol)
+        self.command_queue.put({"action": "update_master", "value": self.master_scale})
+        for sound_data in self.active_sounds.values():
             if sound_data.get("visual_bar_widget"):
-                sound_data["visual_bar_widget"].config(value=int(scaled_vol * 100))
+                scaled_percentage = int(sound_data["base_volume"] * self.master_scale * 100)
+                sound_data["visual_bar_widget"].config(value=scaled_percentage)
 
     def update_individual_volume(self, keyword, val):
         if keyword in self.active_sounds:
             base_vol_float = float(val) / 100.0
             self.active_sounds[keyword]["base_volume"] = base_vol_float
-            self.active_sounds[keyword]["channel"].set_volume(base_vol_float * self.master_scale)
+            self.command_queue.put({"action": "update_individual", "keyword": keyword, "value": base_vol_float})
             if self.active_sounds[keyword].get("visual_bar_widget"):
                 scaled_percentage = int(base_vol_float * self.master_scale * 100)
                 self.active_sounds[keyword]["visual_bar_widget"].config(value=scaled_percentage)
 
     def stop_track_with_gui_sync(self, keyword, callback, fade_ms=1000):
-        """Stops a single channel via UI click and explicitly destroys any lingering timers."""
         if keyword in self.active_sounds:
-            self.volume_history[keyword] = self.active_sounds[keyword]["base_volume"]
+            self.volume_history[_base_keyword(keyword)] = self.active_sounds[keyword]["base_volume"]
             try:
-                with open(HISTORY_FILE, "w") as f:
-                    json.dump(self.volume_history, f, indent=2)
-            except Exception as e:
-                print(f"❌ Error updating track history: {e}")
+                with open(HISTORY_FILE, "w") as f: json.dump(self.volume_history, f, indent=2)
+            except Exception: pass
 
-            # STRATEGY 2: If the user clicks '✕' to manually kill it, cancel the clock immediately
-            if keyword in self.one_shot_timers:
-                try:
-                    slider = self.active_sounds[keyword].get("slider_widget")
-                    if slider:
-                        slider.master.master.master.after_cancel(self.one_shot_timers[keyword])
-                except Exception:
-                    pass
-                del self.one_shot_timers[keyword]
+            if keyword in self.periodic_loops: del self.periodic_loops[keyword]
+            if keyword in self.one_shot_timers: del self.one_shot_timers[keyword]
 
-            channel = self.active_sounds[keyword]["channel"]
-            if channel.get_busy():
-                channel.fadeout(fade_ms)
+            self.command_queue.put({"action": "stop_track", "keyword": keyword, "fade_ms": fade_ms})
             del self.active_sounds[keyword]
             callback()
             return True
@@ -141,29 +264,15 @@ class AudioManager:
 
     def stop_all_sounds_with_fade(self, save_history_callback, fade_ms=3000):
         for keyword, sound_data in self.active_sounds.items():
-            self.volume_history[keyword] = sound_data["base_volume"]
+            self.volume_history[_base_keyword(keyword)] = sound_data["base_volume"]
         try:
-            with open(HISTORY_FILE, "w") as f:
-                json.dump(self.volume_history, f, indent=2)
-            print("\n💾 Track levels saved to system workspace profile.")
-        except Exception as e:
-            print(f"❌ Error writing history file: {e}")
+            with open(HISTORY_FILE, "w") as f: json.dump(self.volume_history, f, indent=2)
+        except Exception: pass
 
-        # FIX: Wiped out the broken pygame video window call entirely to stabilize background threads
+        self.periodic_loops.clear()
         self.one_shot_timers.clear()
-
-        channels_to_fade = [data["channel"] for data in self.active_sounds.values()]
+        self.command_queue.put({"action": "stop_all", "fade_ms": fade_ms})
         self.active_sounds.clear()
-        
         if save_history_callback:
-            try:
-                save_history_callback()
-            except Exception as e:
-                print(f"⚠️ UI layout refresh callback failed: {e}")
-
-        for channel in channels_to_fade:
-            try:
-                if channel.get_busy():
-                    channel.fadeout(fade_ms)
-            except Exception as e:
-                pass
+            try: save_history_callback()
+            except Exception: pass
