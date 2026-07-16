@@ -39,30 +39,38 @@ class TranscriptionEngine:
         self.audio_queue.put(indata.copy())
 
     def start(self, active_keyword_map, root_window_widget):
-        """Arms the engine and seamlessly starts the microphone stream."""
+        """Arms the engine and starts the microphone stream. Returns True on success,
+        False if the microphone couldn't be opened (no device, in use, permission denied)."""
         self.keyword_mapping = active_keyword_map
         self.root_window_widget = root_window_widget
-        self.is_running = True
         self.audio_queue = queue.Queue()
-        
+
         try:
             device_info = sd.query_devices(kind='input')
             self.hardware_sample_rate = int(device_info['default_sample_rate'])
         except Exception:
             self.hardware_sample_rate = 16000
 
-        # Since Pygame lives in a separate sandbox process, this opens flawlessly
-        self.stream = sd.InputStream(
-            samplerate=self.hardware_sample_rate, 
-            channels=1, 
-            callback=self.audio_callback, 
-            blocksize=self.block_size, 
-            dtype="float32"
-        )
-        self.stream.start()
+        try:
+            # Since Pygame lives in a separate sandbox process, this opens flawlessly
+            self.stream = sd.InputStream(
+                samplerate=self.hardware_sample_rate,
+                channels=1,
+                callback=self.audio_callback,
+                blocksize=self.block_size,
+                dtype="float32"
+            )
+            self.stream.start()
+        except Exception as e:
+            print(f"[CRITICAL-ERROR-SPEECH] Failed to open microphone stream: {e}", file=sys.stderr)
+            self.stream = None
+            self.is_running = False
+            return False
+
         print("[DEBUG-SPEECH] Microphone device stream successfully acquired.")
-        
+        self.is_running = True
         threading.Thread(target=self.run_loop, daemon=True).start()
+        return True
 
     def stop(self, save_history_callback):
         self.is_running = False

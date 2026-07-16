@@ -545,6 +545,43 @@ def test_start_falls_back_to_16k_when_device_query_fails(engine_factory, monkeyp
         engine.is_running = False
 
 
+class ExplodingInputStream:
+    """A mic that can't be opened at all: no device, already in use, permission denied, etc."""
+
+    def __init__(self, **_kwargs):
+        raise OSError("Error opening InputStream: Device unavailable")
+
+
+def test_start_returns_false_and_leaves_engine_stopped_when_mic_open_fails(engine_factory, monkeypatch):
+    """Regression test: start() used to only guard sd.query_devices(), leaving the actual
+    sd.InputStream(...) construction unguarded. A missing/busy/permission-denied microphone
+    would raise uncaught from a Tkinter button handler, while is_running was already True -
+    leaving the UI stuck claiming it was listening. start() must now catch this, leave
+    is_running False, and report failure back to the caller."""
+    engine, _audio_manager, _model = engine_factory({})
+    monkeypatch.setattr(speech_module.sd, "query_devices", lambda kind: {"default_sample_rate": 16000.0})
+    monkeypatch.setattr(speech_module.sd, "InputStream", ExplodingInputStream)
+
+    result = engine.start(active_keyword_map={}, root_window_widget=FakeRootStub())
+
+    assert result is False
+    assert engine.is_running is False
+    assert engine.stream is None
+
+
+def test_start_returns_true_on_success(engine_factory, monkeypatch):
+    engine, _audio_manager, _model = engine_factory({})
+    monkeypatch.setattr(speech_module.sd, "query_devices", lambda kind: {"default_sample_rate": 16000.0})
+    monkeypatch.setattr(speech_module.sd, "InputStream", FakeInputStream)
+
+    result = engine.start(active_keyword_map={}, root_window_widget=FakeRootStub())
+    try:
+        assert result is True
+        assert engine.is_running is True
+    finally:
+        engine.is_running = False
+
+
 # ---------------------------------------------------------------------------
 # Sample-rate resampling path
 # ---------------------------------------------------------------------------
