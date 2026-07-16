@@ -13,26 +13,17 @@ class DMSoundApplication:
     def __init__(self):
         # 1. Initialize data folders first
         ensure_environment()
-        
-        # 2. FORCE SYSTEM DRIVER COEXISTENCE (The Windows WASAPI Lock Bypass)
-        # We explicitly turn off Pygame's exclusive audio token grabber BEFORE it boots
-        import os
-        os.environ['SDL_AUDIODRIVER'] = 'directsound'
-        
-        # Initialize your sub-modules natively
+
+        # 2. Initialize your sub-modules natively. AudioManager spawns its own sandboxed
+        # worker process, which selects the right audio driver for the host platform.
         self.audio_manager = AudioManager()
-        
-        # 3. CRITICAL CLEANUP: Instantly wipe the global flag variable out of memory 
-        # The exact millisecond Pygame finishes loading so sounddevice has a clean native space!
-        if 'SDL_AUDIODRIVER' in os.environ:
-            del os.environ['SDL_AUDIODRIVER']
-            
+
         self.speech_engine = TranscriptionEngine(
             audio_manager=self.audio_manager,
             on_keyword_triggered_callback=self.trigger_ui_refresh
         )
         
-        # 4. Assemble standard root window parameters
+        # 3. Assemble standard root window parameters
         self.root = tk.Tk()
         self.root.title("DM Sound Dashboard v2.1")
         self.root.geometry("620x540")
@@ -73,6 +64,7 @@ class DMSoundApplication:
         
         self.sync_keyword_bank()
         self.animate_progress_clocks()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def build_live_mixer_tab(self):
         """Assembles Tab 1 user mixing interfaces with a dynamic scrolling canvas container."""
@@ -268,6 +260,13 @@ class DMSoundApplication:
             )
             
         self.root.after(100, self.animate_progress_clocks)
+
+    def on_close(self):
+        """Ensures the mic stream and the sandboxed audio worker process both shut down cleanly."""
+        if self.speech_engine.is_running:
+            self.speech_engine.stop(save_history_callback=None)
+        self.audio_manager.shutdown()
+        self.root.destroy()
 
     def run(self):
         self.root.mainloop()

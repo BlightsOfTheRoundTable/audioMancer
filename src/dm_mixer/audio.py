@@ -1,26 +1,45 @@
 import os
 import json
+import platform
+import re
 import pygame
 import time
-import struct # Native high-performance binary block decoder
+import struct
 from multiprocessing import Process, Queue
 from dm_mixer.utils import calculate_gains, HISTORY_FILE
 
 def get_audio_file_duration(file_path):
-    """Extracts absolute playback length in seconds using zero-overhead binary block decoding."""
+    """Extracts absolute playback length in seconds by walking the RIFF chunk table."""
     try:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".wav":
             with open(file_path, 'rb') as f:
-                # Rip the RIFF file format layout properties straight from byte index anchors
-                f.seek(22)
-                channels = struct.unpack('<H', f.read(2))[0]
-                sample_rate = struct.unpack('<I', f.read(4))[0]
-                f.seek(34)
-                bits_per_sample = struct.unpack('<H', f.read(2))[0]
-                f.seek(40)
-                data_size = struct.unpack('<I', f.read(4))[0]
-                
+                riff_id, _, wave_id = struct.unpack('<4sI4s', f.read(12))
+                if riff_id != b'RIFF' or wave_id != b'WAVE':
+                    return 3.0
+
+                channels = sample_rate = bits_per_sample = data_size = None
+                while True:
+                    header = f.read(8)
+                    if len(header) < 8:
+                        break
+                    chunk_id, chunk_size = struct.unpack('<4sI', header)
+
+                    if chunk_id == b'fmt ':
+                        fmt_data = f.read(chunk_size)
+                        channels = struct.unpack('<H', fmt_data[2:4])[0]
+                        sample_rate = struct.unpack('<I', fmt_data[4:8])[0]
+                        bits_per_sample = struct.unpack('<H', fmt_data[14:16])[0]
+                    elif chunk_id == b'data':
+                        data_size = chunk_size
+                        break
+                    else:
+                        # Skip unknown chunks (LIST/JUNK/etc), honoring word-alignment padding
+                        f.seek(chunk_size + (chunk_size % 2), 1)
+
+                if not all([channels, sample_rate, bits_per_sample, data_size]):
+                    return 3.0
+
                 duration = data_size / (sample_rate * channels * (bits_per_sample / 8))
                 return max(0.5, duration)
         elif ext in [".mp3", ".ogg"]:
@@ -31,9 +50,17 @@ def get_audio_file_duration(file_path):
         pass
     return 3.0  # Production fallback guess if metadata headers are corrupted
 
+def _base_keyword(keyword):
+    """Strips periodic (' @ every Ns') and burst (' #N-id') suffixes back to the source keyword."""
+    base = keyword.split(" @")[0]
+    return re.sub(r" #\d+-\d+$", "", base)
+
 def pygame_worker_process(command_queue):
     """A completely isolated hardware worker process running the Pygame mixer sandbox."""
-    os.environ['SDL_AUDIODRIVER'] = 'directsound'
+    if platform.system() == "Windows":
+        # DirectSound avoids exclusive-mode WASAPI collisions with the sounddevice mic stream.
+        # macOS (CoreAudio) and Linux don't have this collision, so let SDL pick its own default there.
+        os.environ['SDL_AUDIODRIVER'] = 'directsound'
     try:
         pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
     except pygame.error:
@@ -47,8 +74,11 @@ def pygame_worker_process(command_queue):
         try:
             cmd = command_queue.get()
             if cmd is None:
+                for sound_data in active_sounds.values():
+                    sound_data["channel"].stop()
+                pygame.mixer.quit()
                 break
-                
+
             action = cmd.get("action")
             
             if action == "play":
@@ -57,9 +87,13 @@ def pygame_worker_process(command_queue):
                 one_shot = cmd["one_shot"]
                 base_vol = cmd["base_volume"]
                 
-                if kw in active_sounds or not os.path.exists(file_path):
+                if not os.path.exists(file_path):
                     continue
-                    
+
+                existing = active_sounds.get(kw)
+                if existing and existing["channel"].get_busy():
+                    continue
+
                 try:
                     sound = pygame.mixer.Sound(file_path)
                     channel = pygame.mixer.find_channel()
@@ -120,6 +154,16 @@ class AudioManager:
         self.worker.start()
         print("🔊 AudioManager Sandboxed Worker Process spawned successfully.")
 
+    def shutdown(self):
+        """Gracefully stops the sandboxed worker process on application exit."""
+        try:
+            self.command_queue.put(None)
+        except Exception:
+            pass
+        self.worker.join(timeout=2)
+        if self.worker.is_alive():
+            self.worker.terminate()
+
     def load_history_from_disk(self):
         if os.path.exists(HISTORY_FILE) and os.path.getsize(HISTORY_FILE) > 0:
             try:
@@ -135,8 +179,7 @@ class AudioManager:
         if keyword in self.active_sounds or not os.path.exists(file_path):
             return False
             
-        clean_key = keyword.split(" @")[0]
-        target_base_volume = self.volume_history.get(clean_key, 0.5)
+        target_base_volume = self.volume_history.get(_base_keyword(keyword), 0.5)
         
         # FIX: Extract duration via high-performance structural binary scraping instead of Pygame init!
         duration_seconds = get_audio_file_duration(file_path) if periodic_interval is None else periodic_interval
@@ -189,17 +232,23 @@ class AudioManager:
     def update_master_volume(self, val):
         self.master_scale = float(val) / 100.0
         self.command_queue.put({"action": "update_master", "value": self.master_scale})
+        for sound_data in self.active_sounds.values():
+            if sound_data.get("visual_bar_widget"):
+                scaled_percentage = int(sound_data["base_volume"] * self.master_scale * 100)
+                sound_data["visual_bar_widget"].config(value=scaled_percentage)
 
     def update_individual_volume(self, keyword, val):
         if keyword in self.active_sounds:
             base_vol_float = float(val) / 100.0
             self.active_sounds[keyword]["base_volume"] = base_vol_float
             self.command_queue.put({"action": "update_individual", "keyword": keyword, "value": base_vol_float})
+            if self.active_sounds[keyword].get("visual_bar_widget"):
+                scaled_percentage = int(base_vol_float * self.master_scale * 100)
+                self.active_sounds[keyword]["visual_bar_widget"].config(value=scaled_percentage)
 
     def stop_track_with_gui_sync(self, keyword, callback, fade_ms=1000):
         if keyword in self.active_sounds:
-            clean_key = keyword.split(" @")[0]
-            self.volume_history[clean_key] = self.active_sounds[keyword]["base_volume"]
+            self.volume_history[_base_keyword(keyword)] = self.active_sounds[keyword]["base_volume"]
             try:
                 with open(HISTORY_FILE, "w") as f: json.dump(self.volume_history, f, indent=2)
             except Exception: pass
@@ -215,8 +264,7 @@ class AudioManager:
 
     def stop_all_sounds_with_fade(self, save_history_callback, fade_ms=3000):
         for keyword, sound_data in self.active_sounds.items():
-            clean_key = keyword.split(" @")[0]
-            self.volume_history[clean_key] = sound_data["base_volume"]
+            self.volume_history[_base_keyword(keyword)] = sound_data["base_volume"]
         try:
             with open(HISTORY_FILE, "w") as f: json.dump(self.volume_history, f, indent=2)
         except Exception: pass

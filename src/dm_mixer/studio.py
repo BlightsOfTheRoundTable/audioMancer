@@ -55,7 +55,7 @@ class SoundbankStudioController(tk.Frame):
         self.save_btn = tk.Button(self, text="➕ Add Sound to Campaign Library", font=("Arial", 11, "bold"), bg="#5cb85c", fg="white", activebackground="#4cae4c", relief="flat", padx=10, pady=4, command=self.save)
         self.save_btn.pack(pady=10)
 
-                # =====================================================================
+        # =====================================================================
         # 2. TABULAR INVENTORY VIEW BLOCK WITH NATIVE SCROLLBAR
         # =====================================================================
         library_title = tk.Label(self, text="📜 CAMPAIGN SOUND LIBRARY INVENTORY", fg="#ffffff", bg="#1e1e1e", font=("Arial", 10, "bold"))
