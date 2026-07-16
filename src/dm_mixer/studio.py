@@ -103,9 +103,15 @@ class SoundbankStudioController(tk.Frame):
         )
         chk.pack(side="left", padx=2)
         
-        # Row D: Unified Action Trigger Button
-        self.save_btn = tk.Button(self, text="➕ Add Sound to Campaign Library", font=("Arial", 11, "bold"), bg="#5cb85c", fg="white", activebackground="#4cae4c", relief="flat", padx=10, pady=4, command=self.save)
-        self.save_btn.pack(pady=10)
+        # Row D: Unified Action Trigger Button + Clear/Cancel
+        action_row = tk.Frame(self, bg="#1e1e1e")
+        action_row.pack(pady=10)
+
+        self.save_btn = tk.Button(action_row, text="➕ Add Sound to Campaign Library", font=("Arial", 11, "bold"), bg="#5cb85c", fg="white", activebackground="#4cae4c", relief="flat", padx=10, pady=4, command=self.save)
+        self.save_btn.pack(side="left", padx=(0, 6))
+
+        self.clear_btn = tk.Button(action_row, text="✕ Clear", font=("Arial", 10, "bold"), bg="#444444", fg="#ffffff", activebackground="#666666", relief="flat", padx=10, pady=4, command=self.cancel_edit_state)
+        self.clear_btn.pack(side="left")
 
         # =====================================================================
         # 2. TABULAR INVENTORY VIEW BLOCK WITH NATIVE SCROLLBAR
@@ -175,9 +181,11 @@ class SoundbankStudioController(tk.Frame):
         
         # 4. Morph the action button into an absolute update command
         self.save_btn.config(text="💾 Update Campaign Asset", bg="#ffcc00", fg="#1e1e1e", activebackground="#e6b800")
-        
+        self.clear_btn.config(text="✕ Cancel Edit")
+
     def cancel_edit_state(self):
-        """Resets the input form back to a clean creation layout state."""
+        """Resets the input form back to a clean creation layout state. Also serves as the
+        user-facing "clear staged file" / "cancel edit" action, whichever applies."""
         self.editing_path = None
         self.selected_file_path = None
         self.form_title.config(text="⚙️ IMPORT CUSTOM ATMOSPHERE ASSETS", fg="#ffcc00")
@@ -185,6 +193,7 @@ class SoundbankStudioController(tk.Frame):
         self.kw_entry.delete(0, tk.END)
         self.loop_var.set(value=False)
         self.save_btn.config(text="➕ Add Sound to Campaign Library", bg="#5cb85c", fg="white", activebackground="#4cae4c")
+        self.clear_btn.config(text="✕ Clear")
 
     def save(self):
         if not self.selected_file_path or not self.kw_entry.get().strip():
