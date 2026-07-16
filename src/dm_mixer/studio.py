@@ -5,6 +5,58 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from dm_mixer.utils import USER_SOUNDS_DIR, CONFIG_FILE
 
+
+def _unique_destination_path(directory, filename):
+    """Returns a path for `filename` inside `directory`, appending a numeric suffix like
+    " (1)" if a file with that name already exists there, so importing two different
+    source files that happen to share a basename never silently overwrites one."""
+    base, ext = os.path.splitext(filename)
+    candidate = os.path.join(directory, filename)
+    counter = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{base} ({counter}){ext}")
+        counter += 1
+    return candidate
+
+
+def _copy_into_sounds_library(source_path, allow_overwrite_path=None):
+    """Copies source_path into USER_SOUNDS_DIR, returning the resulting path.
+
+    - If source_path is already sitting at its natural library location, nothing is copied.
+    - If allow_overwrite_path matches the natural destination (replacing a library asset's
+      audio while keeping its existing filename during an edit), it's overwritten in place.
+    - Otherwise, a colliding filename is given a unique suffix rather than silently
+      clobbering an unrelated existing asset.
+    """
+    fn = os.path.basename(source_path)
+    natural_dest = os.path.join(USER_SOUNDS_DIR, fn)
+
+    if os.path.abspath(source_path) == os.path.abspath(natural_dest):
+        return natural_dest
+
+    if allow_overwrite_path and os.path.abspath(natural_dest) == os.path.abspath(allow_overwrite_path):
+        shutil.copy(source_path, natural_dest)
+        return natural_dest
+
+    dest_path = _unique_destination_path(USER_SOUNDS_DIR, fn)
+    shutil.copy(source_path, dest_path)
+    return dest_path
+
+
+def _find_keyword_conflicts(clean_keywords, current_config, exclude_path):
+    """Returns {keyword: conflicting_filename} for any of clean_keywords already claimed
+    by a different sound file already in the library."""
+    conflicts = {}
+    for path, existing_kws in current_config.items():
+        if path == exclude_path:
+            continue
+        existing_clean = {kw.strip().lstrip("!") for kw in existing_kws}
+        for kw in clean_keywords:
+            if kw in existing_clean and kw not in conflicts:
+                conflicts[kw] = os.path.basename(path)
+    return conflicts
+
+
 class SoundbankStudioController(tk.Frame):
     def __init__(self, parent, on_config_changed_callback):
         """
@@ -139,50 +191,58 @@ class SoundbankStudioController(tk.Frame):
             messagebox.showwarning("Incomplete Data", "Please link an audio file and supply trigger words first!")
             return
             
-        raw_kws = [kw.lower().strip() for kw in self.kw_entry.get().split(",") if kw.strip()]
+        raw_kws = [kw.lower().strip().lstrip("!") for kw in self.kw_entry.get().split(",") if kw.strip()]
         new_kws = [kw if self.loop_var.get() else f"!{kw}" for kw in raw_kws]
-        
+
         try:
             current_config = {}
             if os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, "r") as f:
                     current_config = json.load(f)
 
+            conflicts = _find_keyword_conflicts(raw_kws, current_config, self.editing_path)
+            if conflicts:
+                conflict_lines = "\n".join(f'  "{kw}" -> already used by {fname}' for kw, fname in conflicts.items())
+                messagebox.showwarning(
+                    "Duplicate Trigger Keyword",
+                    f"Cannot save - the following keyword(s) are already assigned to another sound:\n\n{conflict_lines}\n\n"
+                    "Use a different trigger word, or edit that existing entry instead."
+                )
+                return
+
             if self.editing_path:
                 # --- UPDATE EXISTING PATH FLOW ---
                 if self.selected_file_path != self.editing_path:
-                    fn = os.path.basename(self.selected_file_path)
-                    dest_path = os.path.join(USER_SOUNDS_DIR, fn)
-                    shutil.copy(self.selected_file_path, dest_path)
-                    
+                    dest_path = _copy_into_sounds_library(self.selected_file_path, allow_overwrite_path=self.editing_path)
+
                     if self.editing_path in current_config:
                         del current_config[self.editing_path]
-                    try:
-                        if os.path.exists(self.editing_path):
-                            os.remove(self.editing_path)
-                    except Exception:
-                        pass
+
+                    if dest_path != self.editing_path:
+                        try:
+                            if os.path.exists(self.editing_path):
+                                os.remove(self.editing_path)
+                        except Exception:
+                            pass
                     final_path = dest_path
                 else:
                     final_path = self.editing_path
-                
+
                 current_config[final_path] = new_kws
                 messagebox.showinfo("Asset Updated", "Campaign asset configurations modified successfully!")
             else:
                 # --- FRESH INITIAL CREATION FLOW ---
-                fn = os.path.basename(self.selected_file_path)
-                dest_path = os.path.join(USER_SOUNDS_DIR, fn)
-                shutil.copy(self.selected_file_path, dest_path)
+                dest_path = _copy_into_sounds_library(self.selected_file_path)
                 current_config[dest_path] = new_kws
-                messagebox.showinfo("Success!", f"Successfully mapped '{fn}' to your library database.")
-            
+                messagebox.showinfo("Success!", f"Successfully mapped '{os.path.basename(dest_path)}' to your library database.")
+
             with open(CONFIG_FILE, "w") as f:
                 json.dump(current_config, f, indent=2)
-                
+
             self.cancel_edit_state()
             self.on_config_changed_callback()
             self.update_library_inventory_gui()
-            
+
         except Exception as e:
             messagebox.showerror("Save Failure", f"Could not process asset update request:\n{e}")
 
