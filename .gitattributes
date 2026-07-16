@@ -1,0 +1,18 @@
+# Normalize line endings to LF in the repo and on checkout for every contributor,
+# regardless of their local core.autocrlf setting, so Windows/Mac/Linux devs never
+# generate whitespace-only diffs on shared source files.
+* text=auto eol=lf
+
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+*.txt text eol=lf
+
+# Binary assets should never be touched by line-ending normalization
+*.wav binary
+*.mp3 binary
+*.ogg binary
+*.pyc binary
