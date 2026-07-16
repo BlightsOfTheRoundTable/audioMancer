@@ -57,15 +57,22 @@ def _base_keyword(keyword):
 
 def pygame_worker_process(command_queue):
     """A completely isolated hardware worker process running the Pygame mixer sandbox."""
-    if platform.system() == "Windows":
+    if platform.system() == "Windows" and "SDL_AUDIODRIVER" not in os.environ:
         # DirectSound avoids exclusive-mode WASAPI collisions with the sounddevice mic stream.
         # macOS (CoreAudio) and Linux don't have this collision, so let SDL pick its own default there.
+        # (The explicit "not already set" check also lets tests force the dummy driver.)
         os.environ['SDL_AUDIODRIVER'] = 'directsound'
     try:
         pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
     except pygame.error:
-        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
-        
+        try:
+            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
+        except pygame.error:
+            # No usable audio device at all (e.g. a headless machine) - fall back to SDL's
+            # silent driver so the app still runs rather than crashing on startup.
+            os.environ['SDL_AUDIODRIVER'] = 'dummy'
+            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+
     pygame.mixer.set_num_channels(16)
     active_sounds = {}
     master_scale = 1.0
