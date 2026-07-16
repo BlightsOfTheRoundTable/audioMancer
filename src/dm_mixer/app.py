@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
 from dm_mixer.utils import ensure_environment, load_keywords, CONFIG_FILE
 from dm_mixer.audio import AudioManager
@@ -140,9 +140,16 @@ class DMSoundApplication:
         
     def toggle_scene_state(self):
         if not self.speech_engine.is_running:
-            self.speech_engine.start(active_keyword_map=self.current_keywords, root_window_widget=self.root)
-            self.action_btn.config(text="End Scene", bg="#d9534f", fg="white")
-            self.status_label.config(text="🎤 Listening for Room Description...", fg="#5cb85c")
+            started = self.speech_engine.start(active_keyword_map=self.current_keywords, root_window_widget=self.root)
+            if started:
+                self.action_btn.config(text="End Scene", bg="#d9534f", fg="white")
+                self.status_label.config(text="🎤 Listening for Room Description...", fg="#5cb85c")
+            else:
+                self.status_label.config(text="⚠️ Microphone Error - Could Not Start", fg="#d9534f")
+                messagebox.showerror(
+                    "Microphone Error",
+                    "Could not access the microphone. Check that one is connected and not already in use by another application."
+                )
         else:
             self.action_btn.config(text="Set the Scene", bg="#5cb85c", fg="white")
             self.status_label.config(text="System: Idle (Audio Fading & Saving)", fg="#aaaaaa")
