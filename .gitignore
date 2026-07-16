@@ -6,3 +6,4 @@ whisper_env/
 build/
 dist/
 .pytest_cache/
+.coverage

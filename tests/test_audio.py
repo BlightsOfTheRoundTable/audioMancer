@@ -1,0 +1,693 @@
+import json
+import os
+import queue
+import struct
+import threading
+import time
+
+import pygame
+import pytest
+
+from dm_mixer.audio import AudioManager, _base_keyword, get_audio_file_duration, pygame_worker_process
+
+
+# ---------------------------------------------------------------------------
+# Test helpers
+# ---------------------------------------------------------------------------
+
+def _write_wav(path, num_frames, sample_rate=8000, channels=1, bits_per_sample=16, extra_chunk=b""):
+    """Writes a minimal, valid silent WAV file, optionally preceded by a filler chunk
+    (e.g. LIST/JUNK) to exercise the RIFF chunk-walking logic in get_audio_file_duration."""
+    bytes_per_sample = bits_per_sample // 8
+    block_align = channels * bytes_per_sample
+    byte_rate = sample_rate * block_align
+    data = b"\x00" * (num_frames * block_align)
+
+    fmt_body = struct.pack("<HHIIHH", 1, channels, sample_rate, byte_rate, block_align, bits_per_sample)
+    body = extra_chunk
+    body += b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+    body += b"data" + struct.pack("<I", len(data)) + data
+
+    riff_size = 4 + len(body)
+    path.write_bytes(b"RIFF" + struct.pack("<I", riff_size) + b"WAVE" + body)
+
+
+def _junk_chunk(content=b"abc"):
+    """A filler chunk with an odd byte count, to verify word-alignment padding is honored."""
+    padding = b"\x00" * (len(content) % 2)
+    return b"JUNK" + struct.pack("<I", len(content)) + content + padding
+
+
+class FakeRoot:
+    """Stands in for the Tkinter root widget's .after()/.after_cancel(), letting tests
+    fire scheduled callbacks deterministically instead of waiting on a real Tk event loop."""
+
+    def __init__(self):
+        self._next_id = 0
+        self._scheduled = {}
+
+    def after(self, _ms, callback):
+        self._next_id += 1
+        task_id = self._next_id
+        self._scheduled[task_id] = callback
+        return task_id
+
+    def after_cancel(self, task_id):
+        self._scheduled.pop(task_id, None)
+
+    def fire(self, task_id):
+        """Simulates the scheduled delay elapsing."""
+        callback = self._scheduled.pop(task_id)
+        callback()
+
+
+class FakeWidget:
+    """Stands in for a ttk.Progressbar - just records the last value it was configured with."""
+
+    def __init__(self):
+        self.value = None
+
+    def config(self, value=None, **_kwargs):
+        self.value = value
+
+
+class FakeProcess:
+    """Stands in for multiprocessing.Process so tests don't spawn a real OS process
+    or touch real audio hardware just to construct an AudioManager."""
+
+    def __init__(self, target=None, args=(), daemon=None, hangs=False):
+        self.target = target
+        self.args = args
+        self.daemon = daemon
+        self.hangs = hangs
+        self._alive = False
+        self.terminated = False
+
+    def start(self):
+        self._alive = True
+
+    def join(self, timeout=None):
+        if not self.hangs:
+            self._alive = False
+
+    def is_alive(self):
+        return self._alive
+
+    def terminate(self):
+        self.terminated = True
+        self._alive = False
+
+
+@pytest.fixture
+def audio_manager(monkeypatch, tmp_path):
+    """A real AudioManager, but with the multiprocessing worker and history file swapped
+    for in-process test doubles so no real subprocess or audio hardware is touched."""
+    monkeypatch.setattr("dm_mixer.audio.Queue", queue.Queue)
+    monkeypatch.setattr("dm_mixer.audio.Process", FakeProcess)
+    monkeypatch.setattr("dm_mixer.audio.HISTORY_FILE", str(tmp_path / "volume_history.json"))
+    return AudioManager()
+
+
+def _recorder():
+    calls = []
+
+    def callback():
+        calls.append(True)
+
+    callback.calls = calls
+    return callback
+
+
+# ---------------------------------------------------------------------------
+# get_audio_file_duration
+# ---------------------------------------------------------------------------
+
+def test_wav_duration_matches_frame_count(tmp_path):
+    wav_path = tmp_path / "tone.wav"
+    _write_wav(wav_path, num_frames=8000 * 2, sample_rate=8000)  # exactly 2 seconds
+
+    assert get_audio_file_duration(str(wav_path)) == pytest.approx(2.0, rel=1e-3)
+
+
+def test_wav_duration_survives_extra_chunk_before_data(tmp_path):
+    """Regression test: earlier code trusted fixed byte offsets and broke on WAVs with a
+    LIST/JUNK chunk before the data chunk. The chunk-walking parser must skip over it."""
+    wav_path = tmp_path / "with_junk.wav"
+    _write_wav(wav_path, num_frames=8000 * 3, sample_rate=8000, extra_chunk=_junk_chunk())
+
+    assert get_audio_file_duration(str(wav_path)) == pytest.approx(3.0, rel=1e-3)
+
+
+def test_wav_duration_real_repo_sound_files():
+    import wave
+
+    for name in ("sounds/rain.wav", "sounds/tavern_background.wav"):
+        with wave.open(name, "rb") as f:
+            expected = f.getnframes() / f.getframerate()
+        assert get_audio_file_duration(name) == pytest.approx(expected, rel=1e-3)
+
+
+def test_wav_duration_falls_back_on_corrupt_header(tmp_path):
+    bad_path = tmp_path / "corrupt.wav"
+    bad_path.write_bytes(b"NOT A REAL WAV HEADER AT ALL")
+
+    assert get_audio_file_duration(str(bad_path)) == 3.0
+
+
+def test_wav_duration_falls_back_when_data_chunk_missing(tmp_path):
+    truncated_path = tmp_path / "truncated.wav"
+    truncated_path.write_bytes(b"RIFF" + struct.pack("<I", 4) + b"WAVE")  # no chunks at all
+
+    assert get_audio_file_duration(str(truncated_path)) == 3.0
+
+
+def test_duration_falls_back_for_missing_file():
+    assert get_audio_file_duration("does/not/exist.wav") == 3.0
+
+
+def test_mp3_duration_uses_bitrate_estimate(tmp_path):
+    mp3_path = tmp_path / "clip.mp3"
+    mp3_path.write_bytes(b"\x00" * 16000)  # 16000 bytes -> 1.0s at the assumed 128kbps
+
+    assert get_audio_file_duration(str(mp3_path)) == pytest.approx(1.0, rel=1e-3)
+
+
+def test_ogg_duration_uses_bitrate_estimate(tmp_path):
+    ogg_path = tmp_path / "clip.ogg"
+    ogg_path.write_bytes(b"\x00" * 32000)  # 32000 bytes -> 2.0s at the assumed 128kbps
+
+    assert get_audio_file_duration(str(ogg_path)) == pytest.approx(2.0, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# _base_keyword
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "keyword, expected",
+    [
+        ("fireball", "fireball"),
+        ("fireball @ every 8s", "fireball"),
+        ("fireball #2-482", "fireball"),
+        ("fireball #14-007", "fireball"),
+    ],
+)
+def test_base_keyword_strips_periodic_and_burst_suffixes(keyword, expected):
+    assert _base_keyword(keyword) == expected
+
+
+# ---------------------------------------------------------------------------
+# pygame_worker_process - synchronous command batches (no real-time waits needed)
+# ---------------------------------------------------------------------------
+
+class _ChannelVolumeSpy:
+    """pygame.mixer.Channel is an immutable C-extension type, so its methods can't be
+    monkeypatched directly. This wraps a real channel instead, recording set_volume calls
+    while transparently delegating everything (play/get_busy/fadeout/etc) to the real thing."""
+
+    def __init__(self, channel, volume_calls):
+        self._channel = channel
+        self._volume_calls = volume_calls
+
+    def set_volume(self, vol):
+        self._volume_calls.append(round(vol, 3))
+        return self._channel.set_volume(vol)
+
+    def __getattr__(self, name):
+        return getattr(self._channel, name)
+
+
+def test_worker_processes_full_command_lifecycle(tmp_path, monkeypatch):
+    monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+    wav_path = tmp_path / "loop.wav"
+    _write_wav(wav_path, num_frames=8000 * 1, sample_rate=8000)  # long enough to stay busy
+
+    volume_calls = []
+    original_find_channel = pygame.mixer.find_channel
+
+    def spy_find_channel(*args, **kwargs):
+        return _ChannelVolumeSpy(original_find_channel(*args, **kwargs), volume_calls)
+
+    monkeypatch.setattr(pygame.mixer, "find_channel", spy_find_channel)
+
+    q = queue.Queue()
+    q.put({"action": "play", "keyword": "rain", "file_path": str(wav_path), "one_shot": False, "base_volume": 0.4})
+    q.put({"action": "update_master", "value": 0.5})
+    q.put({"action": "update_individual", "keyword": "rain", "value": 0.9})
+    q.put({"action": "stop_track", "keyword": "rain", "fade_ms": 10})
+    q.put({"action": "play", "keyword": "storm", "file_path": str(wav_path), "one_shot": False, "base_volume": 0.3})
+    q.put({"action": "stop_all", "fade_ms": 10})
+    q.put(None)
+
+    pygame_worker_process(q)  # processes the whole queue synchronously, then returns
+
+    assert volume_calls == [0.4, 0.2, 0.45, 0.15]
+
+
+def test_worker_skips_play_for_nonexistent_file(monkeypatch):
+    monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+    calls = []
+    monkeypatch.setattr(pygame.mixer, "find_channel", lambda: calls.append(True))
+
+    q = queue.Queue()
+    q.put({"action": "play", "keyword": "ghost", "file_path": "nope.wav", "one_shot": True, "base_volume": 0.5})
+    q.put(None)
+
+    pygame_worker_process(q)
+
+    assert calls == []
+
+
+def test_worker_survives_malformed_command_and_keeps_processing(tmp_path, monkeypatch):
+    monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+    wav_path = tmp_path / "blip.wav"
+    _write_wav(wav_path, num_frames=8000 * 1, sample_rate=8000)
+
+    calls = []
+    original_find_channel = pygame.mixer.find_channel
+
+    def spy(*args, **kwargs):
+        result = original_find_channel(*args, **kwargs)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(pygame.mixer, "find_channel", spy)
+
+    q = queue.Queue()
+    q.put({"action": "update_individual"})  # missing required keys -> raises internally
+    q.put({"action": "play", "keyword": "blip", "file_path": str(wav_path), "one_shot": True, "base_volume": 0.5})
+    q.put(None)
+
+    pygame_worker_process(q)  # must not crash on the malformed command above
+
+    assert len(calls) == 1
+
+
+def test_worker_allows_replay_after_previous_oneshot_finishes(tmp_path, monkeypatch):
+    """Regression test for the periodic re-fire bug: the worker used to permanently mark a
+    keyword as 'active' the moment it was first played, silently dropping every later replay
+    of that same keyword even after the sound had long finished. It must now only block a
+    replay while the previous channel is still actually busy."""
+    monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+    wav_path = tmp_path / "boom.wav"
+    _write_wav(wav_path, num_frames=int(8000 * 0.15), sample_rate=8000)  # ~150ms one-shot
+
+    calls = []
+    original_find_channel = pygame.mixer.find_channel
+
+    def spy(*args, **kwargs):
+        result = original_find_channel(*args, **kwargs)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(pygame.mixer, "find_channel", spy)
+
+    q = queue.Queue()
+    worker_thread = threading.Thread(target=pygame_worker_process, args=(q,), daemon=True)
+    worker_thread.start()
+
+    play_cmd = {"action": "play", "keyword": "boom", "file_path": str(wav_path), "one_shot": True, "base_volume": 0.5}
+
+    q.put(dict(play_cmd))
+    time.sleep(0.03)  # let the channel actually start
+
+    q.put(dict(play_cmd))  # still busy -> must be dropped
+    time.sleep(0.05)
+    assert len(calls) == 1
+
+    time.sleep(0.25)  # let the ~150ms one-shot fully finish
+
+    q.put(dict(play_cmd))  # channel now free -> must be allowed to replay
+    time.sleep(0.05)
+    assert len(calls) == 2
+
+    q.put(None)
+    worker_thread.join(timeout=2)
+    assert not worker_thread.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# AudioManager.play - loops, one-shots, periodic re-fires
+# ---------------------------------------------------------------------------
+
+def test_play_loop_dispatches_command_and_tracks_state(audio_manager, tmp_path):
+    wav_path = tmp_path / "rain.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    callback = _recorder()
+    root = FakeRoot()
+
+    result = audio_manager.play(
+        keyword="rain",
+        file_info={"file_path": str(wav_path), "one_shot": False},
+        on_ui_refresh_callback=callback,
+        root_window_widget=root,
+    )
+
+    assert result is True
+    assert len(callback.calls) == 1
+    assert audio_manager.active_sounds["rain"]["is_one_shot"] is False
+    assert audio_manager.active_sounds["rain"]["is_periodic"] is False
+
+    queued = audio_manager.command_queue.get_nowait()
+    assert queued == {
+        "action": "play", "keyword": "rain", "file_path": str(wav_path),
+        "one_shot": False, "base_volume": 0.5,
+    }
+
+
+def test_play_returns_false_for_missing_file(audio_manager):
+    result = audio_manager.play(
+        keyword="ghost",
+        file_info={"file_path": "does/not/exist.wav", "one_shot": True},
+        on_ui_refresh_callback=_recorder(),
+        root_window_widget=FakeRoot(),
+    )
+
+    assert result is False
+    assert "ghost" not in audio_manager.active_sounds
+
+
+def test_play_returns_false_when_keyword_already_active(audio_manager, tmp_path):
+    wav_path = tmp_path / "rain.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    file_info = {"file_path": str(wav_path), "one_shot": False}
+    callback = _recorder()
+    root = FakeRoot()
+
+    assert audio_manager.play("rain", file_info, callback, root) is True
+    assert audio_manager.play("rain", file_info, callback, root) is False
+    assert len(callback.calls) == 1  # second attempt never re-triggered the callback
+
+
+def test_play_one_shot_schedules_auto_clear(audio_manager, tmp_path):
+    wav_path = tmp_path / "boom.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    callback = _recorder()
+    root = FakeRoot()
+
+    audio_manager.play("boom", {"file_path": str(wav_path), "one_shot": True}, callback, root)
+
+    assert "boom" in audio_manager.one_shot_timers
+    task_id = audio_manager.one_shot_timers["boom"]
+
+    root.fire(task_id)
+
+    assert "boom" not in audio_manager.active_sounds
+    assert "boom" not in audio_manager.one_shot_timers
+    assert len(callback.calls) == 2  # once on trigger, once on auto-clear
+
+
+def test_play_periodic_reschedules_and_refires(audio_manager, tmp_path):
+    wav_path = tmp_path / "thunder.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    callback = _recorder()
+    root = FakeRoot()
+    file_info = {"file_path": str(wav_path), "one_shot": True}
+    periodic_key = "thunder @ every 8s"
+
+    result = audio_manager.play(periodic_key, file_info, callback, root, periodic_interval=8.0)
+
+    assert result is True
+    assert audio_manager.active_sounds[periodic_key]["is_periodic"] is True
+    assert audio_manager.active_sounds[periodic_key]["duration"] == 8.0
+
+    first_cmd = audio_manager.command_queue.get_nowait()
+    assert first_cmd["keyword"] == periodic_key
+
+    first_task_id = audio_manager.periodic_loops[periodic_key]
+    first_start_time = audio_manager.active_sounds[periodic_key]["start_time"]
+
+    root.fire(first_task_id)  # simulate the 8-second interval elapsing
+
+    second_cmd = audio_manager.command_queue.get_nowait()
+    assert second_cmd["keyword"] == periodic_key
+    assert audio_manager.active_sounds[periodic_key]["start_time"] >= first_start_time
+    # A fresh timer must be scheduled so it keeps re-firing indefinitely
+    assert audio_manager.periodic_loops[periodic_key] != first_task_id
+
+
+def test_play_periodic_uses_cleaned_keyword_for_volume_history(audio_manager, tmp_path):
+    wav_path = tmp_path / "thunder.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    audio_manager.volume_history["thunder"] = 0.77
+
+    audio_manager.play(
+        "thunder @ every 8s", {"file_path": str(wav_path), "one_shot": True},
+        _recorder(), FakeRoot(), periodic_interval=8.0,
+    )
+
+    queued = audio_manager.command_queue.get_nowait()
+    assert queued["base_volume"] == 0.77
+
+
+# ---------------------------------------------------------------------------
+# Volume controls
+# ---------------------------------------------------------------------------
+
+def test_update_master_volume_rescales_widgets_and_queues_command(audio_manager):
+    widget = FakeWidget()
+    audio_manager.active_sounds["rain"] = {"base_volume": 0.4, "visual_bar_widget": widget}
+
+    audio_manager.update_master_volume("50")  # Tkinter Scale passes a string
+
+    assert audio_manager.master_scale == 0.5
+    assert widget.value == 20  # 0.4 * 0.5 * 100
+    assert audio_manager.command_queue.get_nowait() == {"action": "update_master", "value": 0.5}
+
+
+def test_update_individual_volume_rescales_widget_and_queues_command(audio_manager):
+    widget = FakeWidget()
+    audio_manager.master_scale = 0.5
+    audio_manager.active_sounds["rain"] = {"base_volume": 0.4, "visual_bar_widget": widget}
+
+    audio_manager.update_individual_volume("rain", "90")
+
+    assert audio_manager.active_sounds["rain"]["base_volume"] == 0.9
+    assert widget.value == 45  # 0.9 * 0.5 * 100
+    assert audio_manager.command_queue.get_nowait() == {
+        "action": "update_individual", "keyword": "rain", "value": 0.9,
+    }
+
+
+def test_update_individual_volume_ignores_unknown_keyword(audio_manager):
+    audio_manager.update_individual_volume("nonexistent", "90")
+
+    with pytest.raises(queue.Empty):
+        audio_manager.command_queue.get_nowait()
+
+
+# ---------------------------------------------------------------------------
+# Stopping tracks + volume-history persistence
+# ---------------------------------------------------------------------------
+
+def test_stop_track_persists_cleaned_history_key(audio_manager, tmp_path):
+    history_file = tmp_path / "volume_history.json"
+    audio_manager.active_sounds["fireball #2-123"] = {"base_volume": 0.7}
+    audio_manager.one_shot_timers["fireball #2-123"] = 99
+    callback = _recorder()
+
+    result = audio_manager.stop_track_with_gui_sync("fireball #2-123", callback, fade_ms=500)
+
+    assert result is True
+    assert audio_manager.volume_history["fireball"] == 0.7
+    assert json.loads(history_file.read_text())["fireball"] == 0.7
+    assert "fireball #2-123" not in audio_manager.active_sounds
+    assert "fireball #2-123" not in audio_manager.one_shot_timers
+    assert len(callback.calls) == 1
+    assert audio_manager.command_queue.get_nowait() == {
+        "action": "stop_track", "keyword": "fireball #2-123", "fade_ms": 500,
+    }
+
+
+def test_stop_track_returns_false_for_inactive_keyword(audio_manager):
+    assert audio_manager.stop_track_with_gui_sync("nothing", _recorder()) is False
+
+
+def test_stop_all_sounds_persists_all_cleaned_history_keys(audio_manager, tmp_path):
+    history_file = tmp_path / "volume_history.json"
+    audio_manager.active_sounds = {
+        "rain": {"base_volume": 0.6},
+        "thunder @ every 8s": {"base_volume": 0.8},
+        "fireball #3-482": {"base_volume": 0.9},
+    }
+    audio_manager.periodic_loops["thunder @ every 8s"] = 1
+    audio_manager.one_shot_timers["fireball #3-482"] = 2
+    callback = _recorder()
+
+    audio_manager.stop_all_sounds_with_fade(save_history_callback=callback, fade_ms=250)
+
+    saved = json.loads(history_file.read_text())
+    assert saved == {"rain": 0.6, "thunder": 0.8, "fireball": 0.9}
+    assert audio_manager.active_sounds == {}
+    assert audio_manager.periodic_loops == {}
+    assert audio_manager.one_shot_timers == {}
+    assert len(callback.calls) == 1
+    assert audio_manager.command_queue.get_nowait() == {"action": "stop_all", "fade_ms": 250}
+
+
+def test_stop_all_sounds_tolerates_missing_callback(audio_manager):
+    audio_manager.active_sounds = {"rain": {"base_volume": 0.5}}
+
+    audio_manager.stop_all_sounds_with_fade(save_history_callback=None)  # must not raise
+
+    assert audio_manager.active_sounds == {}
+
+
+# ---------------------------------------------------------------------------
+# Startup history loading
+# ---------------------------------------------------------------------------
+
+def test_load_history_from_disk_reads_existing_file(monkeypatch, tmp_path):
+    history_file = tmp_path / "volume_history.json"
+    history_file.write_text(json.dumps({"rain": 0.6}))
+    monkeypatch.setattr("dm_mixer.audio.Queue", queue.Queue)
+    monkeypatch.setattr("dm_mixer.audio.Process", FakeProcess)
+    monkeypatch.setattr("dm_mixer.audio.HISTORY_FILE", str(history_file))
+
+    manager = AudioManager()
+
+    assert manager.volume_history == {"rain": 0.6}
+
+
+def test_load_history_from_disk_ignores_corrupt_file(monkeypatch, tmp_path):
+    history_file = tmp_path / "volume_history.json"
+    history_file.write_text("{ not valid json")
+    monkeypatch.setattr("dm_mixer.audio.Queue", queue.Queue)
+    monkeypatch.setattr("dm_mixer.audio.Process", FakeProcess)
+    monkeypatch.setattr("dm_mixer.audio.HISTORY_FILE", str(history_file))
+
+    manager = AudioManager()  # must not raise
+
+    assert manager.volume_history == {}
+
+
+def test_load_history_from_disk_ignores_empty_file(monkeypatch, tmp_path):
+    history_file = tmp_path / "volume_history.json"
+    history_file.write_text("")
+    monkeypatch.setattr("dm_mixer.audio.Queue", queue.Queue)
+    monkeypatch.setattr("dm_mixer.audio.Process", FakeProcess)
+    monkeypatch.setattr("dm_mixer.audio.HISTORY_FILE", str(history_file))
+
+    manager = AudioManager()
+
+    assert manager.volume_history == {}
+
+
+# ---------------------------------------------------------------------------
+# Worker shutdown
+# ---------------------------------------------------------------------------
+
+def test_shutdown_terminates_a_hung_worker(monkeypatch, tmp_path):
+    monkeypatch.setattr("dm_mixer.audio.Queue", queue.Queue)
+    monkeypatch.setattr("dm_mixer.audio.Process", lambda target, args, daemon: FakeProcess(target, args, daemon, hangs=True))
+    monkeypatch.setattr("dm_mixer.audio.HISTORY_FILE", str(tmp_path / "volume_history.json"))
+    manager = AudioManager()
+
+    manager.shutdown()
+
+    assert manager.command_queue.get_nowait() is None
+    assert manager.worker.terminated is True
+
+
+def test_shutdown_leaves_a_cleanly_exiting_worker_alone(audio_manager):
+    audio_manager.shutdown()
+
+    assert audio_manager.command_queue.get_nowait() is None
+    assert audio_manager.worker.terminated is False
+
+
+# ---------------------------------------------------------------------------
+# Disk-write / callback failure resilience
+# ---------------------------------------------------------------------------
+
+def test_stop_track_tolerates_history_write_failure(monkeypatch, audio_manager):
+    # Point HISTORY_FILE at a directory, so open(..., "w") raises IsADirectoryError/PermissionError
+    monkeypatch.setattr("dm_mixer.audio.HISTORY_FILE", ".")
+    audio_manager.active_sounds["rain"] = {"base_volume": 0.5}
+
+    result = audio_manager.stop_track_with_gui_sync("rain", _recorder())  # must not raise
+
+    assert result is True
+
+
+def test_stop_all_tolerates_history_write_failure(monkeypatch, audio_manager):
+    monkeypatch.setattr("dm_mixer.audio.HISTORY_FILE", ".")
+    audio_manager.active_sounds["rain"] = {"base_volume": 0.5}
+
+    audio_manager.stop_all_sounds_with_fade(save_history_callback=None)  # must not raise
+
+    assert audio_manager.active_sounds == {}
+
+
+def test_stop_all_tolerates_save_history_callback_exception(audio_manager):
+    def exploding_callback():
+        raise RuntimeError("UI teardown failed")
+
+    audio_manager.stop_all_sounds_with_fade(save_history_callback=exploding_callback)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Audio driver fallback
+# ---------------------------------------------------------------------------
+
+def test_worker_falls_back_to_dummy_driver_when_no_real_device_available(monkeypatch):
+    attempts = []
+    original_init = pygame.mixer.init
+
+    def flaky_init(*args, **kwargs):
+        attempts.append(dict(os.environ).get("SDL_AUDIODRIVER"))
+        if len(attempts) < 3:
+            raise pygame.error("no audio device")
+        return original_init(*args, **kwargs)  # let the 3rd (dummy-driver) attempt really succeed
+
+    monkeypatch.setattr(pygame.mixer, "init", flaky_init)
+    monkeypatch.delenv("SDL_AUDIODRIVER", raising=False)
+
+    q = queue.Queue()
+    q.put(None)
+
+    pygame_worker_process(q)  # must not raise despite the first two init attempts failing
+
+    assert len(attempts) == 3
+    assert attempts[-1] == "dummy"
+
+
+def test_shutdown_tolerates_queue_put_failure(audio_manager):
+    def raising_put(_value):
+        raise RuntimeError("queue is closed")
+
+    audio_manager.command_queue.put = raising_put
+
+    audio_manager.shutdown()  # must not raise despite the put() failure
+
+    assert audio_manager.worker.is_alive() is False
+
+
+def test_play_one_shot_tolerates_stale_timer_cancel_failure(audio_manager, tmp_path):
+    class RaisingAfterCancelRoot(FakeRoot):
+        def after_cancel(self, task_id):
+            raise RuntimeError("timer already gone")
+
+    wav_path = tmp_path / "boom.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    audio_manager.one_shot_timers["boom"] = 999  # stale timer, no matching active_sounds entry
+
+    result = audio_manager.play(
+        "boom", {"file_path": str(wav_path), "one_shot": True},
+        _recorder(), RaisingAfterCancelRoot(),
+    )
+
+    assert result is True
+    assert "boom" in audio_manager.active_sounds
+
+
+def test_worker_logs_and_continues_when_sound_construction_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+    bogus_path = tmp_path / "not_really_audio.wav"
+    bogus_path.write_bytes(b"this is not valid audio data at all")
+
+    q = queue.Queue()
+    q.put({"action": "play", "keyword": "bad", "file_path": str(bogus_path), "one_shot": True, "base_volume": 0.5})
+    q.put(None)
+
+    pygame_worker_process(q)  # must not crash; the bad Sound() call is caught and logged
