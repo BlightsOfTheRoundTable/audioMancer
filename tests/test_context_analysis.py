@@ -36,14 +36,23 @@ def _cues_for(sentence, keyword):
         ("two explosions rock the tower", "explosion", 2, None, 1.0),
         # --- quantity: partitive "N of KEYWORD" construction ---
         ("a couple of explosions rock the tower", "explosion", 2, None, 1.0),
+        ("a pair of arrows fly by", "arrow", 2, None, 1.0),
+        ("a swarm of goblins approaches", "goblin", 6, None, 1.0),
+        ("a horde of goblins approaches", "goblin", 8, None, 1.0),
+        # --- quantity: higher numbers (found missing during vocabulary review - only up to
+        # "six"/"dozen" were covered, "seven" through "twenty" produced no quantity cue at all) ---
+        ("seven arrows fly through the air", "arrow", 7, None, 1.0),
         # --- periodic: explicit "every ..." ---
         ("thunder rumbles every fifteen seconds", "thunder", 1, 15.0, 1.0),
         ("thunder rumbles every minute", "thunder", 1, 60.0, 1.0),
         ("thunder rumbles every 20 seconds", "thunder", 1, 20.0, 1.0),
+        ("thunder rumbles every twenty seconds", "thunder", 1, 20.0, 1.0),
         ("a drip occurs every so often", "drip", 1, 15.0, 1.0),
         # --- periodic: idioms without the word "every" ---
         ("you hear a drip once and a while", "drip", 1, 20.0, 1.0),
         ("you hear thunder occasionally", "thunder", 1, 20.0, 1.0),
+        ("you hear thunder repeatedly", "thunder", 1, 15.0, 1.0),
+        ("you hear a drip on and off", "drip", 1, 15.0, 1.0),
         # --- volume/intensity: modifier attached to the verb, not the keyword directly ---
         ("there's an explosion outside", "explosion", 1, None, 0.2),
         ("you hear an explosion outside", "explosion", 1, None, 0.2),
@@ -52,6 +61,8 @@ def _cues_for(sentence, keyword):
         # --- volume/intensity: adjective directly on the keyword ---
         ("a faint drip echoes in the hall", "drip", 1, None, 0.12),
         ("a distant explosion rumbles", "explosion", 1, None, 0.2),
+        ("a muted explosion rumbles", "explosion", 1, None, 0.35),
+        ("a blaring explosion rocks the tower", "explosion", 1, None, 2.0),
         # --- volume/intensity: multiple modifiers, strongest wins ---
         ("a distant, muffled explosion rumbles", "explosion", 1, None, 0.2),
         # --- volume/intensity: louder/size descriptors (found missing during manual testing -
@@ -60,6 +71,10 @@ def _cues_for(sentence, keyword):
         ("suddenly there is a massive explosion", "explosion", 1, None, 2.4),
         ("a huge explosion rocks the tower", "explosion", 1, None, 2.0),
         ("a tiny drip echoes", "drip", 1, None, 0.12),
+        # --- volume/intensity: multi-word spatial phrases that don't reduce to a single
+        # amod/advmod/prep token - matched as substrings instead of via the dependency parse ---
+        ("thunder rumbles off in the distance", "thunder", 1, None, 0.2),
+        ("the dragon roars right next to you", "dragon", 1, None, 1.6),
         # --- no cues present at all ---
         ("i hear rain outside my window", "rain", 1, None, 0.2),
         ("the goblins are approaching", "goblin", 1, None, 1.0),
@@ -98,6 +113,11 @@ def test_cues_expose_the_source_word_for_logging():
 
     quantity_cues = _cues_for("three arrows fly through the air", "arrow")
     assert quantity_cues.quantity_word == "three"
+
+
+def test_multi_word_volume_phrase_exposes_the_matched_phrase_for_logging():
+    cues = _cues_for("thunder rumbles off in the distance", "thunder")
+    assert cues.volume_modifier_word == "off in the distance"
 
 
 def test_source_words_are_none_when_nothing_matched():
