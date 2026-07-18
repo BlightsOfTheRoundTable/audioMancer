@@ -38,12 +38,18 @@ class FakeAudioManager:
 
     def __init__(self):
         self.play_calls = []
+        self.rejected_calls = []
         self.active_sounds = {}
         self.stop_all_calls = []
+        self.reject_keywords = set()  # keywords that should behave as "already active" (play() -> False)
 
-    def play(self, keyword, file_info, on_ui_refresh_callback, root_window_widget, periodic_interval=None):
+    def play(self, keyword, file_info, on_ui_refresh_callback, root_window_widget, periodic_interval=None, context_volume_multiplier=1.0, context_modifier_word=None):
+        if keyword in self.reject_keywords:
+            self.rejected_calls.append(keyword)
+            return False
         self.play_calls.append({
             "keyword": keyword, "file_info": file_info, "periodic_interval": periodic_interval,
+            "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word,
         })
         self.active_sounds[keyword] = True
         on_ui_refresh_callback()
@@ -110,13 +116,76 @@ def _run_and_stop(engine, timeout=2.0):
     return thread
 
 
-def _push_chunk(engine, num_samples=32000):
+def _push_chunk(engine, num_samples=56000):
     engine.audio_queue.put(np.zeros(num_samples, dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
 # Keyword substring matching
 # ---------------------------------------------------------------------------
+
+def test_skipped_play_logs_instead_of_claiming_success(engine_factory, capsys):
+    """Regression test: the console used to print "Triggering ..." unconditionally, even when
+    AudioManager.play() silently rejected the call (e.g. the keyword was already active) -
+    misleadingly implying a sound played when nothing actually happened. It must now check
+    the return value and log a "Skipped" message instead."""
+    engine, audio_manager, model = engine_factory({
+        "explosion": {"file_path": "sounds/explosion.wav", "one_shot": True},
+    })
+    audio_manager.reject_keywords.add("explosion")
+    model.queue_response(["you hear an explosion"])
+
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)
+        assert _wait_until(lambda: audio_manager.rejected_calls == ["explosion"])
+        assert audio_manager.play_calls == []
+        captured = capsys.readouterr()
+        assert "Skipped 'explosion'" in captured.out
+        assert "Triggering 'explosion'" not in captured.out
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
+
+def test_skipped_periodic_play_logs_instead_of_claiming_success(engine_factory, capsys):
+    engine, audio_manager, model = engine_factory({
+        "thunder": {"file_path": "sounds/thunder.wav", "one_shot": True},
+    })
+    audio_manager.reject_keywords.add("thunder @ every 8s")
+    model.queue_response(["thunder rumbles every 8 seconds"])
+
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)
+        assert _wait_until(lambda: audio_manager.rejected_calls == ["thunder @ every 8s"])
+        assert audio_manager.play_calls == []
+        captured = capsys.readouterr()
+        assert "Skipped 'thunder' (every 8s)" in captured.out
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
+
+def test_skipped_burst_shot_logs_instead_of_silently_dropping(engine_factory, monkeypatch, capsys):
+    engine, audio_manager, model = engine_factory({
+        "arrow": {"file_path": "sounds/arrow.wav", "one_shot": True},
+    })
+    monkeypatch.setattr(speech_module, "time", FakeTimeModule())
+    audio_manager.reject_keywords.add("arrow")  # only the bare (shot 0) key collides here
+    model.queue_response(["three arrows fly through the air"])
+
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)
+        assert _wait_until(lambda: "arrow" in audio_manager.rejected_calls, timeout=3.0)
+        assert _wait_until(lambda: len(audio_manager.play_calls) == 2, timeout=3.0)  # shots 2 and 3 still land
+        captured = capsys.readouterr()
+        assert "Skipped burst shot 1/3 for 'arrow'" in captured.out
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
 
 def test_matched_keyword_triggers_audio_manager_play(engine_factory):
     engine, audio_manager, model = engine_factory({
@@ -156,6 +225,70 @@ def test_run_loop_survives_transcribe_crash_and_keeps_running(engine_factory):
         _push_chunk(engine)  # first chunk: transcribe raises, loop must not die
         assert _wait_until(lambda: call_count[0] >= 1)
         _push_chunk(engine)  # second chunk: transcribe succeeds normally
+        assert _wait_until(lambda: len(audio_manager.play_calls) == 1)
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
+
+def test_run_loop_survives_a_single_keyword_analysis_crash(engine_factory, monkeypatch):
+    """Regression test: a crash analyzing ONE keyword's context cues used to be caught only by
+    the outer per-chunk try/except, which silently killed the entire listening session (no log,
+    loop just stopped) - the DM would have no idea why nothing was firing anymore. A crash
+    analyzing one keyword must not even prevent OTHER keywords in the same chunk from firing."""
+    engine, audio_manager, model = engine_factory({
+        "explosion": {"file_path": "sounds/explosion.wav", "one_shot": True},
+        "rain": {"file_path": "sounds/rain.wav", "one_shot": False},
+    })
+    model.queue_response(["an explosion booms while rain falls"])
+
+    original_analyze = speech_module.context_analysis.analyze_occurrence
+
+    def flaky_analyze(doc, start, end):
+        text = doc.text[start:end]
+        if text.startswith("explosion"):
+            raise RuntimeError("simulated analysis crash")
+        return original_analyze(doc, start, end)
+
+    monkeypatch.setattr(speech_module.context_analysis, "analyze_occurrence", flaky_analyze)
+
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)
+        assert _wait_until(lambda: len(audio_manager.play_calls) == 1)
+        assert audio_manager.play_calls[0]["keyword"] == "rain"  # explosion crashed, rain still fired
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
+
+def test_run_loop_survives_an_unexpected_chunk_level_error(engine_factory, monkeypatch):
+    """Regression test: any unexpected exception processing one chunk used to silently break
+    out of run_loop entirely - the background thread would just vanish. It must log the error
+    and keep listening for the next chunk instead."""
+    engine, audio_manager, model = engine_factory({
+        "rain": {"file_path": "sounds/rain.wav", "one_shot": False},
+    })
+    model.queue_response(["i hear rain outside"])
+    model.queue_response(["i hear rain outside"])
+
+    call_count = [0]
+    original_parse_chunk = speech_module.context_analysis.parse_chunk
+
+    def flaky_parse_chunk(clean_text):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise RuntimeError("simulated chunk-level crash")
+        return original_parse_chunk(clean_text)
+
+    monkeypatch.setattr(speech_module.context_analysis, "parse_chunk", flaky_parse_chunk)
+
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)  # first chunk: parse_chunk raises, loop must not die
+        assert _wait_until(lambda: call_count[0] >= 1)
+        assert thread.is_alive()
+        _push_chunk(engine)  # second chunk: succeeds normally
         assert _wait_until(lambda: len(audio_manager.play_calls) == 1)
     finally:
         engine.is_running = False
@@ -595,7 +728,7 @@ def test_run_loop_resamples_when_hardware_rate_differs(engine_factory):
 
     thread = _run_and_stop(engine)
     try:
-        _push_chunk(engine, num_samples=48000 * 2)  # 2 seconds of mic audio at 48kHz
+        _push_chunk(engine, num_samples=int(48000 * 3.5))  # 3.5 seconds of mic audio at 48kHz
         assert _wait_until(lambda: len(audio_manager.play_calls) == 1)
         assert audio_manager.play_calls[0]["keyword"] == "rain"
     finally:

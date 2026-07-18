@@ -2,20 +2,30 @@ import queue
 import re
 import sys
 import threading
+import traceback
 import random
 import time
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 
-QUANTITY_MAP = {
-    "a": 1, "an": 1, "one": 1, "single": 1,
-    "two": 2, "couple": 2, "twin": 2, "double": 2,
-    "three": 3, "triple": 3, "several": 3, "multiple": 3,
-    "four": 4, "few": 4, "many": 5, "handful": 5,
-    "five": 5, "six": 6, "half-dozen": 6, "half dozen": 6,
-    "dozen": 12, "countless": 5, "barrage": 6, "volley": 5
-}
+from dm_mixer import context_analysis
+
+
+def _describe_trigger(keyword, fire_count=1, periodic_seconds=None, volume_multiplier=1.0, volume_modifier_word=None):
+    """Builds a human-readable console description of exactly why/how a trigger fired, e.g.
+    "'explosion' (faint -> quieter, 0.40x)" vs plain "'explosion'" - so it's obvious from the
+    terminal alone which circumstance caused which sound, not just that something fired."""
+    parts = [f"'{keyword}'"]
+    if periodic_seconds is not None:
+        parts.append(f"(recurring every {int(periodic_seconds)}s)")
+    if fire_count > 1:
+        parts.append(f"x{fire_count}")
+    if volume_modifier_word:
+        direction = "quieter" if volume_multiplier < 1.0 else "louder"
+        parts.append(f"({volume_modifier_word} -> {direction}, {volume_multiplier:.2f}x)")
+    return " ".join(parts)
+
 
 class TranscriptionEngine:
     def __init__(self, audio_manager, on_keyword_triggered_callback):
@@ -30,8 +40,19 @@ class TranscriptionEngine:
         self.whisper_target_rate = 16000
         self.block_size = 4000
 
+        # How long to let audio accumulate before transcribing/acting on it. Widened from an
+        # original 2.0s/4.0s pair to give trailing verbal modifiers ("...off in the distance")
+        # more time to actually be spoken before the engine commits to firing on a bare keyword
+        # mention - a quick mitigation for keywords firing before a qualifier that follows them
+        # has even been said yet. Trades a bit of added latency on every trigger for that.
+        self.min_buffer_seconds = 3.5
+        self.buffer_reset_seconds = 7.0
+
         print("⏳ Loading Whisper model into memory... (This takes a moment)")
         self.model = WhisperModel("base", device="cpu", compute_type="int8")
+
+        print("⏳ Loading spaCy language model for context analysis...")
+        context_analysis.get_nlp()
 
     def audio_callback(self, indata, frames, time_info, status):
         if status:
@@ -85,13 +106,7 @@ class TranscriptionEngine:
         print("[DEBUG-SPEECH-THREAD] Background evaluation thread AWAKE.")
         audio_buffer = np.zeros(0, dtype=np.float32)
         phrase_cooldowns = {}
-        
-        TIME_WORDS = {
-            "few": 4.0, "couple": 4.0, "so": 15.0, "often": 15.0,
-            "five": 5.0, "ten": 10.0, "fifteen": 15.0, "thirty": 30.0,
-            "minute": 60.0, "dozen": 12.0
-        }
-        
+
         while self.is_running:
             try:
                 try: data = self.audio_queue.get(timeout=0.5)
@@ -112,7 +127,7 @@ class TranscriptionEngine:
                 
                 current_timestamp = time.time()
                 
-                if len(audio_buffer) >= self.whisper_target_rate * 2:
+                if len(audio_buffer) >= self.whisper_target_rate * self.min_buffer_seconds:
                     try:
                         segments, _ = self.model.transcribe(audio_buffer, beam_size=3, vad_filter=True, language="en")
                         segments = list(segments)
@@ -121,98 +136,117 @@ class TranscriptionEngine:
                     for segment in segments:
                         clean_text = segment.text.lower().strip()
                         print(f"\r💬 Hearing description: {segment.text.strip()}", end="", flush=True)
-                        
+
+                        # One spaCy parse per chunk, reused for every keyword checked against it -
+                        # much cheaper than re-parsing the same sentence once per keyword.
+                        doc = context_analysis.parse_chunk(clean_text)
+
                         for keyword, file_info in self.keyword_mapping.items():
-                            # Left boundary only (not \bkeyword\b): stops "rat" firing inside
-                            # "narrate", while still matching spoken plurals/suffixes like
-                            # "arrow" inside "arrows" or "goblin" inside "goblins".
-                            # finditer (not search): a single transcribed chunk can legitimately
-                            # contain more than one distinct mention of the same keyword (e.g.
-                            # "two explosions ... and then two more explosions") - matching only
-                            # the first would silently drop every later mention.
-                            matches = list(re.finditer(r'\b' + re.escape(keyword), clean_text))
-                            if matches:
+                            try:
+                                # Left boundary only (not \bkeyword\b): stops "rat" firing inside
+                                # "narrate", while still matching spoken plurals/suffixes like
+                                # "arrow" inside "arrows" or "goblin" inside "goblins".
+                                # finditer (not search): a single transcribed chunk can legitimately
+                                # contain more than one distinct mention of the same keyword (e.g.
+                                # "two explosions ... and then two more explosions") - matching only
+                                # the first would silently drop every later mention.
+                                matches = list(re.finditer(r'\b' + re.escape(keyword), clean_text))
+                                if not matches:
+                                    continue
+
                                 if keyword in phrase_cooldowns and current_timestamp - phrase_cooldowns[keyword] < 4.0:
                                     continue
-                                
-                                phrase_cooldowns[keyword] = current_timestamp
-                                periodic_seconds = None
-                                
-                                if "every" in clean_text:
-                                    try:
-                                        words = clean_text.split()
-                                        if "every" in words:
-                                            idx = words.index("every")
-                                            sub_slice = words[idx:idx+4]
-                                            for token in sub_slice:
-                                                if token.isdigit():
-                                                    periodic_seconds = float(token)
-                                                    break
-                                                elif token in TIME_WORDS:
-                                                    periodic_seconds = TIME_WORDS[token]
-                                                    break
-                                            if periodic_seconds is None: periodic_seconds = 8.0
-                                    except Exception: periodic_seconds = 8.0
 
-                                if periodic_seconds is not None:
-                                    unique_periodic_key = f"{keyword} @ every {int(periodic_seconds)}s"
-                                    self.audio_manager.play(
+                                phrase_cooldowns[keyword] = current_timestamp
+
+                                # Periodic recurrence ("every N seconds", "once in a while", ...)
+                                # is sentence-wide, not tied to a specific mention, and is
+                                # mutually exclusive with quantity/volume - checking the first
+                                # occurrence is representative of the whole chunk.
+                                first_cues = context_analysis.analyze_occurrence(doc, matches[0].start(), matches[0].end())
+                                if first_cues.periodic_seconds is not None:
+                                    unique_periodic_key = f"{keyword} @ every {int(first_cues.periodic_seconds)}s"
+                                    played = self.audio_manager.play(
                                         keyword=unique_periodic_key, file_info=file_info,
                                         on_ui_refresh_callback=self.on_keyword_triggered_callback,
-                                        root_window_widget=self.root_window_widget, periodic_interval=periodic_seconds
+                                        root_window_widget=self.root_window_widget, periodic_interval=first_cues.periodic_seconds,
+                                        context_volume_multiplier=first_cues.volume_multiplier,
+                                        context_modifier_word=first_cues.volume_modifier_word,
                                     )
+                                    if played:
+                                        print(f"\n🔁 Triggering {_describe_trigger(keyword, periodic_seconds=first_cues.periodic_seconds, volume_multiplier=first_cues.volume_multiplier, volume_modifier_word=first_cues.volume_modifier_word)}")
+                                    else:
+                                        print(f"\n⏭️  Skipped '{keyword}' (every {int(first_cues.periodic_seconds)}s) - already active")
                                     continue
-                                    
+
                                 # Sum quantities across every distinct mention of this keyword in
                                 # the chunk, so "two explosions ... two more explosions" fires 4
-                                # total rather than only counting the first mention.
+                                # total rather than only counting the first mention. The volume
+                                # reading with the largest deviation from neutral (1.0) across all
+                                # mentions applies to the whole burst/play.
                                 fire_count = 0
+                                volume_multiplier = 1.0
+                                volume_modifier_word = None
+                                strongest_deviation = 0.0
                                 for occurrence in matches:
-                                    occurrence_count = 1
-                                    try:
-                                        char_index = occurrence.start()
-                                        left_chunk = clean_text[max(0, char_index - 40):char_index].strip()
-                                        chunk_words = left_chunk.split()
-                                        context_words = chunk_words[-3:] if len(chunk_words) >= 3 else chunk_words
-
-                                        for word in reversed(context_words):
-                                            word_clean = word.replace(".", "").replace(",", "").strip()
-                                            if word_clean in QUANTITY_MAP:
-                                                occurrence_count = QUANTITY_MAP[word_clean]
-                                                break
-                                            elif word_clean.isdigit():
-                                                occurrence_count = min(15, int(word_clean))
-                                                break
-                                    except Exception: pass
-                                    fire_count += occurrence_count
+                                    cues = context_analysis.analyze_occurrence(doc, occurrence.start(), occurrence.end())
+                                    fire_count += cues.fire_count
+                                    deviation = abs(cues.volume_multiplier - 1.0)
+                                    if deviation > strongest_deviation:
+                                        strongest_deviation = deviation
+                                        volume_multiplier = cues.volume_multiplier
+                                        volume_modifier_word = cues.volume_modifier_word
                                 fire_count = min(15, fire_count)
 
                                 if file_info["one_shot"] and fire_count > 1:
-                                    print(f"\n⚡ MULTI-BURST VOLLEY RESOLVED: [{fire_count}x {keyword.upper()}]")
+                                    print(f"\n⚡ Triggering {_describe_trigger(keyword, fire_count=fire_count, volume_multiplier=volume_multiplier, volume_modifier_word=volume_modifier_word)}")
                                     volley_id = str(int(time.time() * 100))[-3:]
-                                    
-                                    def dispatch_burst(total_shots, kw, info, callback, widget, group_id):
+
+                                    def dispatch_burst(total_shots, kw, info, callback, widget, group_id, vol_multiplier, vol_word):
                                         for shot in range(total_shots):
                                             unique_kw_id = f"{kw} #{shot + 1}-{group_id}" if shot > 0 or kw in self.audio_manager.active_sounds else kw
-                                            self.audio_manager.play(
+                                            played = self.audio_manager.play(
                                                 keyword=unique_kw_id, file_info=info,
-                                                on_ui_refresh_callback=callback, root_window_widget=widget
+                                                on_ui_refresh_callback=callback, root_window_widget=widget,
+                                                context_volume_multiplier=vol_multiplier,
+                                                context_modifier_word=vol_word,
                                             )
+                                            if not played:
+                                                print(f"\n⏭️  Skipped burst shot {shot + 1}/{total_shots} for '{kw}' - already active")
                                             time.sleep(random.uniform(0.15, 0.45))
-                                            
+
                                     threading.Thread(
-                                        target=dispatch_burst, 
-                                        args=(fire_count, keyword, file_info, self.on_keyword_triggered_callback, self.root_window_widget, volley_id),
+                                        target=dispatch_burst,
+                                        args=(fire_count, keyword, file_info, self.on_keyword_triggered_callback, self.root_window_widget, volley_id, volume_multiplier, volume_modifier_word),
                                         daemon=True
                                     ).start()
                                 else:
-                                    self.audio_manager.play(
+                                    played = self.audio_manager.play(
                                         keyword=keyword, file_info=file_info,
                                         on_ui_refresh_callback=self.on_keyword_triggered_callback,
-                                        root_window_widget=self.root_window_widget
+                                        root_window_widget=self.root_window_widget,
+                                        context_volume_multiplier=volume_multiplier,
+                                        context_modifier_word=volume_modifier_word,
                                     )
-                                
-                    if len(audio_buffer) >= self.whisper_target_rate * 4:
+                                    if played:
+                                        print(f"\n🔊 Triggering {_describe_trigger(keyword, volume_multiplier=volume_multiplier, volume_modifier_word=volume_modifier_word)}")
+                                    else:
+                                        print(f"\n⏭️  Skipped '{keyword}' - already active/playing")
+                            except Exception:
+                                # Never let one keyword's analysis take down the whole listening
+                                # session - log it and keep checking the REST of the keywords
+                                # against this same chunk.
+                                print(f"\n[ERROR-CONTEXT-ANALYSIS] Failed processing keyword {keyword!r}:", file=sys.stderr)
+                                traceback.print_exc()
+                                continue
+
+                    if len(audio_buffer) >= self.whisper_target_rate * self.buffer_reset_seconds:
                         audio_buffer = np.zeros(0, dtype=np.float32)
-            except Exception: break
+            except Exception:
+                # A truly unexpected error must not silently end the whole listening session -
+                # log it so it's diagnosable, and keep the mic stream alive for the next chunk
+                # rather than dying with zero indication of why keywords stopped firing.
+                print("\n[CRITICAL-ERROR-SPEECH] Unexpected error inside run_loop:", file=sys.stderr)
+                traceback.print_exc()
+                continue
 
