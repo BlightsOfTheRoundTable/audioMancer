@@ -64,7 +64,7 @@ def analyze_occurrence(doc, match_start, match_end):
         cues.fire_count = min(context_config.MAX_FIRE_COUNT, fire_count)
         cues.quantity_word = quantity_word
 
-    cues.volume_multiplier, cues.volume_modifier_word = _detect_volume_multiplier(anchor)
+    cues.volume_multiplier, cues.volume_modifier_word = _detect_volume_multiplier(anchor, doc)
 
     return cues
 
@@ -131,18 +131,26 @@ def _detect_periodic_seconds(doc):
     return None
 
 
-def _detect_volume_multiplier(anchor):
-    """Checks three attachment patterns real dependency parses actually produce:
-    (1) an adjective directly modifying the keyword ("a distant explosion", "a faint drip");
+def _detect_volume_multiplier(anchor, doc):
+    """Checks four sources real natural phrasing actually produces:
+    (1) an adjective directly modifying the keyword ("a distant explosion", "a faint drip") -
+    also accepts "compound", since spaCy's small model inconsistently tags some attributive
+    present-participles ("a blaring explosion") as compound rather than amod even though
+    grammatically they're playing the same role;
     (2) a prepositional phrase attached directly to the keyword ("rain outside my window");
     (3) an adverbial/prepositional modifier attached to the keyword's head verb as a SIBLING
     of the keyword, not a child of it (e.g. "an explosion rumbles outside" -> both "explosion"
-    and "outside" attach to "rumbles", not to each other). If more than one modifier matches,
-    the strongest one (largest deviation from neutral 1.0) wins.
-    Returns (multiplier, source_word) - source_word is None when nothing matched (multiplier 1.0)."""
+    and "outside" attach to "rumbles", not to each other);
+    (4) a multi-word spatial/intensity phrase matched as a substring of the whole chunk
+    ("off in the distance", "right next to you") - these frequently don't reduce to a single
+    amod/advmod/prep token the way (1)-(3) expect, so they're checked independently of the
+    dependency parse, same as RECURRENCE_PHRASES.
+    If more than one candidate matches, the strongest one (largest deviation from neutral 1.0)
+    wins. Returns (multiplier, source_word) - source_word is None when nothing matched
+    (multiplier 1.0)."""
     candidates = []
     for child in anchor.children:
-        if child.dep_ in ("amod", "prep"):
+        if child.dep_ in ("amod", "compound", "prep"):
             candidates.append(child.text.lower())
 
     if anchor.head is not anchor:
@@ -162,6 +170,15 @@ def _detect_volume_multiplier(anchor):
             best_strength = strength
             best_multiplier = multiplier
             best_word = word
+
+    text = doc.text.lower()
+    for phrase, multiplier in context_config.VOLUME_PHRASES.items():
+        if phrase in text:
+            strength = abs(multiplier - 1.0)
+            if strength > best_strength:
+                best_strength = strength
+                best_multiplier = multiplier
+                best_word = phrase
 
     if best_multiplier is None:
         return 1.0, None
