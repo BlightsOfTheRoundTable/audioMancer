@@ -105,7 +105,9 @@ def pygame_worker_process(command_queue):
                     sound = pygame.mixer.Sound(file_path)
                     channel = pygame.mixer.find_channel()
                     if channel:
-                        channel.set_volume(calculate_gains(base_vol, master_scale))
+                        final_volume = calculate_gains(base_vol, master_scale)
+                        channel.set_volume(final_volume)
+                        print(f"🔊 [WORKER] '{kw}': channel.set_volume({final_volume:.3f}) = base_volume({base_vol:.3f}) x master_scale({master_scale:.3f}); channel reports back {channel.get_volume():.3f}")
                         if one_shot:
                             channel.play(sound, loops=0)
                         else:
@@ -180,40 +182,51 @@ class AudioManager:
             except Exception as e:
                 print(f"⚠️ Could not load history file: {e}")
 
-    def play(self, keyword, file_info, on_ui_refresh_callback, root_window_widget, periodic_interval=None):
-        """Dispatches non-blocking IPC commands to the sandboxed audio hardware worker process."""
+    def play(self, keyword, file_info, on_ui_refresh_callback, root_window_widget, periodic_interval=None, context_volume_multiplier=1.0, context_modifier_word=None):
+        """Dispatches non-blocking IPC commands to the sandboxed audio hardware worker process.
+
+        context_volume_multiplier is an automatic per-utterance adjustment (e.g. "outside" ->
+        quieter) layered on top of the DM's manually-set slider baseline. It's kept separate
+        from base_volume so it never gets persisted to volume_history.json - a "quiet explosion
+        outside" must not permanently quiet the slider for the next fresh explosion.
+        context_modifier_word is the actual word that produced the multiplier (e.g. "faint"),
+        carried alongside purely so the UI can show the DM why a track sounds different from
+        where its slider is sitting.
+        """
         file_path = file_info["file_path"]
         if keyword in self.active_sounds or not os.path.exists(file_path):
             return False
-            
+
         target_base_volume = self.volume_history.get(_base_keyword(keyword), 0.5)
-        
+        effective_volume = max(0.0, min(1.0, target_base_volume * context_volume_multiplier))
+        print(f"🎚️  '{keyword}': base_volume={target_base_volume:.3f} x context_multiplier={context_volume_multiplier:.3f} = effective_volume={effective_volume:.3f} (sent to worker, before master scale)")
+
         # FIX: Extract duration via high-performance structural binary scraping instead of Pygame init!
         duration_seconds = get_audio_file_duration(file_path) if periodic_interval is None else periodic_interval
         start_time = time.time()
-        
+
         if periodic_interval is not None:
-            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": target_base_volume})
-            self.active_sounds[keyword] = {"base_volume": target_base_volume, "is_one_shot": False, "is_periodic": True, "duration": periodic_interval, "start_time": start_time}
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": effective_volume})
+            self.active_sounds[keyword] = {"base_volume": target_base_volume, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": False, "is_periodic": True, "duration": periodic_interval, "start_time": start_time}
             on_ui_refresh_callback()
             self.schedule_next_periodic_pass(keyword, file_info, periodic_interval, on_ui_refresh_callback, root_window_widget)
             return True
-            
+
         if file_info["one_shot"]:
             if keyword in self.one_shot_timers:
                 try: root_window_widget.after_cancel(self.one_shot_timers[keyword])
                 except Exception: pass
-            
-            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": target_base_volume})
-            self.active_sounds[keyword] = {"base_volume": target_base_volume, "is_one_shot": True, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
+
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": effective_volume})
+            self.active_sounds[keyword] = {"base_volume": target_base_volume, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": True, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
             on_ui_refresh_callback()
-            
+
             duration_ms = int(duration_seconds * 1000) + 200
             task_id = root_window_widget.after(duration_ms, lambda: self.auto_clear_expired_one_shot(keyword, on_ui_refresh_callback))
             self.one_shot_timers[keyword] = task_id
         else:
-            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": False, "base_volume": target_base_volume})
-            self.active_sounds[keyword] = {"base_volume": target_base_volume, "is_one_shot": False, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": False, "base_volume": effective_volume})
+            self.active_sounds[keyword] = {"base_volume": target_base_volume, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": False, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
             on_ui_refresh_callback()
         return True
 
@@ -226,9 +239,10 @@ class AudioManager:
     def execute_periodic_fire(self, keyword, file_info, interval, callback, root):
         if keyword not in self.active_sounds: return
         if os.path.exists(file_info["file_path"]):
-            current_slider_vol = self.active_sounds[keyword]["base_volume"]
-            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_info["file_path"], "one_shot": True, "base_volume": current_slider_vol})
-            self.active_sounds[keyword]["start_time"] = time.time()
+            entry = self.active_sounds[keyword]
+            effective_volume = max(0.0, min(1.0, entry["base_volume"] * entry.get("context_volume_multiplier", 1.0)))
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_info["file_path"], "one_shot": True, "base_volume": effective_volume})
+            entry["start_time"] = time.time()
         self.schedule_next_periodic_pass(keyword, file_info, interval, callback, root)
 
     def auto_clear_expired_one_shot(self, keyword, on_ui_refresh_callback):
@@ -241,13 +255,21 @@ class AudioManager:
         self.command_queue.put({"action": "update_master", "value": self.master_scale})
         for sound_data in self.active_sounds.values():
             if sound_data.get("visual_bar_widget"):
-                scaled_percentage = int(sound_data["base_volume"] * self.master_scale * 100)
+                # Include context_volume_multiplier so the "Live Output" bar reflects what's
+                # actually playing, not just the slider baseline - a "faint" explosion should
+                # visibly show as quieter than its slider position suggests, not just sound it.
+                effective = sound_data["base_volume"] * sound_data.get("context_volume_multiplier", 1.0)
+                scaled_percentage = int(max(0.0, min(1.0, effective)) * self.master_scale * 100)
                 sound_data["visual_bar_widget"].config(value=scaled_percentage)
 
     def update_individual_volume(self, keyword, val):
         if keyword in self.active_sounds:
             base_vol_float = float(val) / 100.0
             self.active_sounds[keyword]["base_volume"] = base_vol_float
+            # A manual drag is the DM taking explicit control - the slider position should mean
+            # exactly what it shows, not "your drag times an invisible automatic factor."
+            self.active_sounds[keyword]["context_volume_multiplier"] = 1.0
+            self.active_sounds[keyword]["context_modifier_word"] = None
             self.command_queue.put({"action": "update_individual", "keyword": keyword, "value": base_vol_float})
             if self.active_sounds[keyword].get("visual_bar_widget"):
                 scaled_percentage = int(base_vol_float * self.master_scale * 100)

@@ -355,6 +355,77 @@ def test_play_loop_dispatches_command_and_tracks_state(audio_manager, tmp_path):
     }
 
 
+def test_play_applies_context_volume_multiplier_to_effective_volume(audio_manager, tmp_path):
+    """The context multiplier scales what's SENT to the worker, but must not overwrite the
+    manually-set base_volume (that's the DM's slider baseline, persisted to volume_history.json
+    - a "quiet explosion outside" must not permanently quiet the slider for the next one)."""
+    wav_path = tmp_path / "boom.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    audio_manager.volume_history["boom"] = 0.8
+
+    audio_manager.play(
+        keyword="boom",
+        file_info={"file_path": str(wav_path), "one_shot": True},
+        on_ui_refresh_callback=_recorder(),
+        root_window_widget=FakeRoot(),
+        context_volume_multiplier=0.5,
+    )
+
+    queued = audio_manager.command_queue.get_nowait()
+    assert queued["base_volume"] == 0.4  # 0.8 * 0.5
+    assert audio_manager.active_sounds["boom"]["base_volume"] == 0.8  # manual baseline untouched
+    assert audio_manager.active_sounds["boom"]["context_volume_multiplier"] == 0.5
+
+
+def test_play_stores_context_modifier_word_for_ui_display(audio_manager, tmp_path):
+    """The source word (e.g. "faint") is carried alongside the multiplier purely so the UI can
+    show the DM why a track sounds different from where its slider is sitting."""
+    wav_path = tmp_path / "boom.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+
+    audio_manager.play(
+        keyword="boom",
+        file_info={"file_path": str(wav_path), "one_shot": True},
+        on_ui_refresh_callback=_recorder(),
+        root_window_widget=FakeRoot(),
+        context_volume_multiplier=0.4,
+        context_modifier_word="faint",
+    )
+
+    assert audio_manager.active_sounds["boom"]["context_modifier_word"] == "faint"
+
+
+def test_play_defaults_context_modifier_word_to_none(audio_manager, tmp_path):
+    wav_path = tmp_path / "rain.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+
+    audio_manager.play(
+        keyword="rain",
+        file_info={"file_path": str(wav_path), "one_shot": False},
+        on_ui_refresh_callback=_recorder(),
+        root_window_widget=FakeRoot(),
+    )
+
+    assert audio_manager.active_sounds["rain"]["context_modifier_word"] is None
+
+
+def test_play_clamps_effective_volume_at_one(audio_manager, tmp_path):
+    wav_path = tmp_path / "boom.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    audio_manager.volume_history["boom"] = 0.9
+
+    audio_manager.play(
+        keyword="boom",
+        file_info={"file_path": str(wav_path), "one_shot": True},
+        on_ui_refresh_callback=_recorder(),
+        root_window_widget=FakeRoot(),
+        context_volume_multiplier=1.5,  # 0.9 * 1.5 = 1.35, must clamp to 1.0
+    )
+
+    queued = audio_manager.command_queue.get_nowait()
+    assert queued["base_volume"] == 1.0
+
+
 def test_play_returns_false_for_missing_file(audio_manager):
     result = audio_manager.play(
         keyword="ghost",
@@ -426,6 +497,27 @@ def test_play_periodic_reschedules_and_refires(audio_manager, tmp_path):
     assert audio_manager.periodic_loops[periodic_key] != first_task_id
 
 
+def test_execute_periodic_fire_carries_context_multiplier_forward(audio_manager, tmp_path):
+    """A recurring 'distant explosion every 20 seconds' must stay distant-sounding on every
+    re-fire, not just the first shot."""
+    wav_path = tmp_path / "thunder.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    callback = _recorder()
+    root = FakeRoot()
+    file_info = {"file_path": str(wav_path), "one_shot": True}
+    periodic_key = "thunder @ every 8s"
+    audio_manager.volume_history["thunder"] = 0.8
+
+    audio_manager.play(periodic_key, file_info, callback, root, periodic_interval=8.0, context_volume_multiplier=0.5)
+    audio_manager.command_queue.get_nowait()  # discard the initial play command
+
+    task_id = audio_manager.periodic_loops[periodic_key]
+    root.fire(task_id)  # simulate the 8-second interval elapsing
+
+    refire_cmd = audio_manager.command_queue.get_nowait()
+    assert refire_cmd["base_volume"] == 0.4  # 0.8 * 0.5, still quieted on re-fire
+
+
 def test_play_periodic_uses_cleaned_keyword_for_volume_history(audio_manager, tmp_path):
     wav_path = tmp_path / "thunder.wav"
     _write_wav(wav_path, num_frames=8000, sample_rate=8000)
@@ -455,6 +547,20 @@ def test_update_master_volume_rescales_widgets_and_queues_command(audio_manager)
     assert audio_manager.command_queue.get_nowait() == {"action": "update_master", "value": 0.5}
 
 
+def test_update_master_volume_reflects_context_multiplier_in_the_output_bar(audio_manager):
+    """The 'Live Output' bar must reflect what's actually playing (including any active
+    context adjustment), not just base_volume * master_scale - otherwise a "faint" explosion
+    would show the same output level as an unmodified one despite genuinely playing quieter."""
+    widget = FakeWidget()
+    audio_manager.active_sounds["boom"] = {
+        "base_volume": 0.8, "context_volume_multiplier": 0.5, "visual_bar_widget": widget,
+    }
+
+    audio_manager.update_master_volume("50")
+
+    assert widget.value == 20  # 0.8 * 0.5 (context) * 0.5 (master) * 100
+
+
 def test_update_individual_volume_rescales_widget_and_queues_command(audio_manager):
     widget = FakeWidget()
     audio_manager.master_scale = 0.5
@@ -467,6 +573,19 @@ def test_update_individual_volume_rescales_widget_and_queues_command(audio_manag
     assert audio_manager.command_queue.get_nowait() == {
         "action": "update_individual", "keyword": "rain", "value": 0.9,
     }
+
+
+def test_update_individual_volume_resets_context_multiplier_to_neutral(audio_manager):
+    """A manual slider drag is the DM taking explicit control - the slider position should
+    mean exactly what it shows, not 'your drag times an invisible automatic factor.'"""
+    audio_manager.active_sounds["rain"] = {
+        "base_volume": 0.4, "context_volume_multiplier": 0.5, "context_modifier_word": "faint",
+    }
+
+    audio_manager.update_individual_volume("rain", "70")
+
+    assert audio_manager.active_sounds["rain"]["context_volume_multiplier"] == 1.0
+    assert audio_manager.active_sounds["rain"]["context_modifier_word"] is None
 
 
 def test_update_individual_volume_ignores_unknown_keyword(audio_manager):

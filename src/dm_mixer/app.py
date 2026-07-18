@@ -194,7 +194,16 @@ class DMSoundApplication:
             lbl = tk.Label(row, text=f"  {keyword.capitalize()}", fg="#ffffff", bg="#2d2d2d", font=("Arial", 11), width=12, anchor="w")
             lbl.pack(side="left")
             lbl.bind("<MouseWheel>", _forward_wheel)
-            
+
+            # Shows the actual word that adjusted this trigger's volume (e.g. "faint"), so the
+            # DM can see WHY it sounds different from where the slider is sitting - the slider
+            # itself deliberately keeps showing their manual baseline, not the one-time override.
+            modifier_word = sound_data.get("context_modifier_word")
+            if modifier_word:
+                modifier_lbl = tk.Label(row, text=f"({modifier_word})", fg="#00bcff", bg="#2d2d2d", font=("Arial", 9, "italic"))
+                modifier_lbl.pack(side="left", padx=(0, 5))
+                modifier_lbl.bind("<MouseWheel>", _forward_wheel)
+
             canvas = tk.Canvas(row, width=20, height=20, bg="#2d2d2d", highlightthickness=0)
             canvas.pack(side="left", padx=(5, 5))
             sound_data["canvas_widget"] = canvas
@@ -204,14 +213,20 @@ class DMSoundApplication:
             slider = tk.Scale(
                 row, from_=0, to=100, orient="horizontal", showvalue=False,
                 bg="#2d2d2d", fg="#ffffff", highlightthickness=0, troughcolor="#1e1e1e", activebackground="#5cb85c",
-                command=lambda val, kw=keyword: self.audio_manager.update_individual_volume(kw, val)
             )
+            # Tkinter gotcha: Scale.set() fires its `command` callback once the widget is part
+            # of a visible window - attaching `command` only AFTER set() (instead of at
+            # construction) stops that initial programmatic set from being mistaken for a real
+            # user drag, which was silently resetting context_volume_multiplier back to 1.0 and
+            # overwriting the just-applied volume within milliseconds of every trigger.
             slider.set(current_vol_percentage)
+            slider.config(command=lambda val, kw=keyword: self.audio_manager.update_individual_volume(kw, val))
             slider.pack(side="left", fill="x", expand=True, padx=10)
             sound_data["slider_widget"] = slider
             slider.bind("<MouseWheel>", _forward_wheel)
             
-            scaled_percentage = int(sound_data["base_volume"] * self.audio_manager.master_scale * 100)
+            effective_volume = sound_data["base_volume"] * sound_data.get("context_volume_multiplier", 1.0)
+            scaled_percentage = int(max(0.0, min(1.0, effective_volume)) * self.audio_manager.master_scale * 100)
             progress_bar = ttk.Progressbar(row, orient="horizontal", length=60, mode="determinate", style="Horizontal.TProgressbar")
             progress_bar.config(maximum=100, value=scaled_percentage)
             progress_bar.pack(side="left", padx=(5, 10))
