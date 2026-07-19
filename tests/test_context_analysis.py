@@ -47,6 +47,10 @@ def _cues_for(sentence, keyword):
         ("thunder rumbles every minute", "thunder", 1, 60.0, 1.0),
         ("thunder rumbles every 20 seconds", "thunder", 1, 20.0, 1.0),
         ("thunder rumbles every twenty seconds", "thunder", 1, 20.0, 1.0),
+        # --- periodic: basic spelled-out numbers (found missing during a bug investigation -
+        # "two" wasn't in RECURRENCE_TIME_WORDS at all, so "every two seconds" silently fell
+        # back to DEFAULT_PERIODIC_SECONDS (8.0) instead of resolving to 2.0) ---
+        ("thunder rumbles every two seconds", "thunder", 1, 2.0, 1.0),
         ("a drip occurs every so often", "drip", 1, 15.0, 1.0),
         # --- periodic: idioms without the word "every" ---
         ("you hear a drip once and a while", "drip", 1, 20.0, 1.0),

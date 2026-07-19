@@ -34,6 +34,12 @@ RECURRENCE_TIME_WORDS = {
     "minute": 60.0, "dozen": 12.0,
     "seven": 7.0, "eight": 8.0, "nine": 9.0, "twenty": 20.0, "forty": 40.0,
     "sixty": 60.0, "hour": 3600.0,
+    # Basic spelled-out numbers (found missing during a bug investigation - only digits like
+    # "2" resolved correctly via isdigit(); "every two seconds" silently fell back to
+    # DEFAULT_PERIODIC_SECONDS instead of resolving to 2.0).
+    "one": 1.0, "two": 2.0, "three": 3.0, "four": 4.0, "six": 6.0,
+    "eleven": 11.0, "twelve": 12.0, "thirteen": 13.0, "fourteen": 14.0,
+    "sixteen": 16.0, "seventeen": 17.0, "eighteen": 18.0, "nineteen": 19.0,
 }
 
 # Single-word recurrence idioms with no "every" present at all ("thunder occasionally").

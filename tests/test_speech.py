@@ -551,6 +551,41 @@ def test_every_phrase_triggers_periodic_play_with_expected_interval(engine_facto
         thread.join(timeout=2)
 
 
+def test_periodic_modifier_spoken_after_keyword_still_arms_the_loop(engine_factory, monkeypatch):
+    """Regression test: the audio buffer gets re-transcribed in full on every incoming chunk
+    while it's between min_buffer_seconds and buffer_reset_seconds long, so a keyword spoken
+    BEFORE its recurrence modifier ("you hear thunder every 2 seconds") can be matched by an
+    early, partial pass containing only "...thunder" - before "every 2 seconds" has even been
+    spoken. That early pass used to fire a one-shot and lock phrase_cooldowns, which then
+    permanently blocked the later, fuller pass (once "every 2 seconds" was actually in the
+    transcript) from ever being evaluated as periodic, silently dropping the loop entirely.
+    Periodic detection must run before the cooldown gate so the later pass still arms the loop."""
+    engine, audio_manager, model = engine_factory({
+        "thunder": {"file_path": "sounds/thunder.wav", "one_shot": True},
+    })
+    fake_time = FakeTimeModule()
+    monkeypatch.setattr(speech_module, "time", fake_time)
+
+    model.queue_response(["you hear thunder"])  # modifier not spoken/captured yet
+    model.queue_response(["you hear thunder every 2 seconds"])  # full phrase, moments later
+
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)
+        assert _wait_until(lambda: len(audio_manager.play_calls) == 1)
+        assert audio_manager.play_calls[0]["keyword"] == "thunder"
+        assert audio_manager.play_calls[0]["periodic_interval"] is None
+
+        fake_time.advance(0.5)  # still well within the 4s cooldown window
+        _push_chunk(engine)
+        assert _wait_until(lambda: len(audio_manager.play_calls) == 2)
+        assert audio_manager.play_calls[1]["keyword"] == "thunder @ every 2s"
+        assert audio_manager.play_calls[1]["periodic_interval"] == 2.0
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
+
 def test_every_as_part_of_another_word_is_not_treated_as_periodic(engine_factory):
     """'everywhere' contains the substring 'every' but is not the standalone word 'every',
     so it must not be misparsed as a periodic re-fire request."""
