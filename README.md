@@ -4,15 +4,27 @@ A voice-activated, automated ambient/sound-effect mixer for tabletop Dungeon Mas
 description out loud and matching background loops or one-shot effects fire automatically, mixed
 live in a desktop dashboard.
 
+## Installing
+
+Download the latest installer for your platform from the
+[Releases page](https://github.com/BlightsOfTheRoundTable/audioMancer/releases):
+
+- **Windows**: run `DM-Mixer-Setup-<version>.exe` and follow the wizard. The installer is
+  unsigned, so Windows SmartScreen will warn that it's from an unrecognized publisher - click
+  **More info → Run anyway** to proceed.
+- **macOS**: open the `.dmg` and drag **DM Mixer** into Applications. The app is unsigned/
+  unnotarized, so Gatekeeper will block the first launch - right-click the app → **Open** → confirm
+  to proceed. (Only needed once.)
+
 ## Requirements
 
-- Python 3.11
 - A working microphone input device
 - Windows or macOS
 
-## Setup
+## Setup (from source)
 
-This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management. Requires
+Python 3.11.
 
 ```bash
 uv sync
@@ -56,3 +68,9 @@ User configuration (imported sounds and keyword mappings) and saved volume level
 ```bash
 uv run pytest
 ```
+
+## Building the installers
+
+See [packaging/README.md](packaging/README.md) for building the Windows/macOS installers
+yourself. `.github/workflows/build-installers.yml` builds both automatically on a version tag
+push.

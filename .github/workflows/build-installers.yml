@@ -1,0 +1,99 @@
+name: Build installers
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022 # pinned, not windows-latest - that image doesn't reliably ship Inno Setup
+            platform: windows
+          - os: macos-latest
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: irm https://astral.sh/uv/install.ps1 | iex
+
+      - name: Install uv (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Sync dependencies (build group)
+        shell: bash
+        run: uv sync --group build
+
+      - name: Read app version from pyproject.toml
+        id: version
+        shell: bash
+        run: echo "value=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")" >> "$GITHUB_OUTPUT"
+
+      - name: Build with PyInstaller
+        shell: bash
+        run: uv run pyinstaller packaging/pyinstaller.spec --noconfirm
+
+      - name: Install Inno Setup
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build Windows installer
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        # Uses pwsh, not bash, specifically to avoid Git-Bash-on-Windows mangling the /D flag
+        # as a path (confirmed locally: iscc rejected "/DMyAppVersion=..." under bash until
+        # escaped, which pwsh doesn't need).
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\installer.iss "/DMyAppVersion=${{ steps.version.outputs.value }}"
+
+      - name: Upload Windows installer
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: packaging/windows/Output/*.exe
+
+      - name: Build macOS disk image
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          hdiutil create -volname "DM Mixer" -srcfolder "dist/DM Mixer.app" -ov -format UDZO "DM-Mixer-${{ steps.version.outputs.value }}.dmg"
+
+      - name: Upload macOS installer
+        if: matrix.platform == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: "*.dmg"
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            artifacts/windows-installer/*.exe \
+            artifacts/macos-installer/*.dmg \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
