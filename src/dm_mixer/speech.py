@@ -154,15 +154,20 @@ class TranscriptionEngine:
                                 if not matches:
                                     continue
 
-                                if keyword in phrase_cooldowns and current_timestamp - phrase_cooldowns[keyword] < 4.0:
-                                    continue
-
-                                phrase_cooldowns[keyword] = current_timestamp
-
-                                # Periodic recurrence ("every N seconds", "once in a while", ...)
-                                # is sentence-wide, not tied to a specific mention, and is
-                                # mutually exclusive with quantity/volume - checking the first
-                                # occurrence is representative of the whole chunk.
+                                # Periodic recurrence ("every N seconds", "once in a while", ...) is
+                                # sentence-wide, not tied to a specific mention, and is checked BEFORE
+                                # the cooldown gate below - deliberately not gated by phrase_cooldowns
+                                # at all. The audio buffer gets re-transcribed in full every ~0.1-0.25s
+                                # while it's between min_buffer_seconds and buffer_reset_seconds long,
+                                # so when the recurrence modifier is spoken AFTER the keyword ("you
+                                # hear thunder every 2 seconds"), an earlier partial pass can match the
+                                # bare keyword alone (before "every 2 seconds" has even been spoken),
+                                # fire it as a one-shot, and lock the cooldown - which used to
+                                # permanently swallow the later, fuller pass's periodic detection for
+                                # the rest of that cooldown window. AudioManager.play() already dedupes
+                                # repeat periodic starts via the unique "keyword @ every Ns" key, so
+                                # this path doesn't need the cooldown's protection the way the
+                                # one-shot/burst path below does.
                                 first_cues = context_analysis.analyze_occurrence(doc, matches[0].start(), matches[0].end())
                                 if first_cues.periodic_seconds is not None:
                                     unique_periodic_key = f"{keyword} @ every {int(first_cues.periodic_seconds)}s"
@@ -178,6 +183,11 @@ class TranscriptionEngine:
                                     else:
                                         print(f"\n⏭️  Skipped '{keyword}' (every {int(first_cues.periodic_seconds)}s) - already active")
                                     continue
+
+                                if keyword in phrase_cooldowns and current_timestamp - phrase_cooldowns[keyword] < 4.0:
+                                    continue
+
+                                phrase_cooldowns[keyword] = current_timestamp
 
                                 # Sum quantities across every distinct mention of this keyword in
                                 # the chunk, so "two explosions ... two more explosions" fires 4
