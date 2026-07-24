@@ -720,6 +720,145 @@ def test_shutdown_leaves_a_cleanly_exiting_worker_alone(audio_manager):
 
 
 # ---------------------------------------------------------------------------
+# Worker process supervision
+# ---------------------------------------------------------------------------
+
+def _drain(command_queue):
+    commands = []
+    while True:
+        try:
+            commands.append(command_queue.get_nowait())
+        except queue.Empty:
+            break
+    return commands
+
+
+def test_check_worker_health_returns_false_when_worker_is_healthy(audio_manager):
+    original_worker = audio_manager.worker
+
+    result = audio_manager.check_worker_health(FakeRoot(), _recorder())
+
+    assert result is False
+    assert audio_manager.worker is original_worker  # untouched, no restart
+
+
+def test_check_worker_health_restarts_a_dead_worker(audio_manager, capsys):
+    audio_manager.worker._alive = False  # simulate a crash
+    callback = _recorder()
+
+    result = audio_manager.check_worker_health(FakeRoot(), callback)
+
+    assert result is True
+    assert audio_manager.worker.is_alive() is True  # a fresh worker was spawned and started
+    assert callback.calls == [True]
+    assert "crashed" in capsys.readouterr().err
+
+
+def test_check_worker_health_restarts_a_hung_worker(audio_manager, capsys):
+    """A worker that's still alive but hasn't ticked its heartbeat in far longer than it
+    would even if fully idle - a stuck-but-not-crashed worker, not just a quiet one."""
+    audio_manager.heartbeat.value = time.time() - 999
+
+    result = audio_manager.check_worker_health(FakeRoot(), _recorder())
+
+    assert result is True
+    assert "stopped responding" in capsys.readouterr().err
+
+
+def test_check_worker_health_tolerates_teardown_failure_and_still_restarts(audio_manager, capsys):
+    audio_manager.worker._alive = False
+
+    def raising_terminate():
+        raise RuntimeError("process handle already gone")
+
+    audio_manager.worker.terminate = raising_terminate
+
+    result = audio_manager.check_worker_health(FakeRoot(), _recorder())
+
+    assert result is True
+    assert audio_manager.worker.is_alive() is True  # a fresh worker still gets spawned
+    assert "Trouble tearing down" in capsys.readouterr().err
+
+
+def test_check_worker_health_resumes_active_background_loops(audio_manager, tmp_path):
+    wav_path = tmp_path / "rain.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    audio_manager.active_sounds["rain"] = {
+        "base_volume": 0.6, "context_volume_multiplier": 0.5, "file_path": str(wav_path),
+        "is_one_shot": False, "is_periodic": False,
+    }
+    audio_manager.master_scale = 0.7
+    audio_manager.worker._alive = False
+
+    audio_manager.check_worker_health(FakeRoot(), _recorder())
+
+    commands = _drain(audio_manager.command_queue)
+    assert {"action": "update_master", "value": 0.7} in commands
+    # The DM's manual master volume must apply to the resumed loop too, not the worker's
+    # fresh-restart default of 1.0.
+    assert {
+        "action": "play", "keyword": "rain", "file_path": str(wav_path),
+        "one_shot": False, "base_volume": 0.3,  # 0.6 base x 0.5 context
+    } in commands
+
+
+def test_check_worker_health_does_not_resume_one_shots_or_periodic_entries(audio_manager, tmp_path):
+    """One-shots are momentary - replaying one late would be the wrong sound at the wrong
+    time. Periodic re-fires resume on their own next scheduled tick without help."""
+    wav_path = tmp_path / "boom.wav"
+    _write_wav(wav_path, num_frames=8000, sample_rate=8000)
+    audio_manager.active_sounds["boom"] = {
+        "base_volume": 0.5, "file_path": str(wav_path), "is_one_shot": True, "is_periodic": False,
+    }
+    audio_manager.active_sounds["thunder @ every 8s"] = {
+        "base_volume": 0.5, "file_path": str(wav_path), "is_one_shot": False, "is_periodic": True,
+    }
+    audio_manager.worker._alive = False
+
+    audio_manager.check_worker_health(FakeRoot(), _recorder())
+
+    play_commands = [c for c in _drain(audio_manager.command_queue) if c["action"] == "play"]
+    assert play_commands == []
+
+
+def test_check_worker_health_skips_resuming_a_loop_whose_file_no_longer_exists(audio_manager, tmp_path):
+    audio_manager.active_sounds["gone"] = {
+        "base_volume": 0.5, "file_path": str(tmp_path / "missing.wav"),
+        "is_one_shot": False, "is_periodic": False,
+    }
+    audio_manager.worker._alive = False
+
+    audio_manager.check_worker_health(FakeRoot(), _recorder())
+
+    play_commands = [c for c in _drain(audio_manager.command_queue) if c["action"] == "play"]
+    assert play_commands == []
+
+
+def test_worker_updates_heartbeat_even_when_idle(monkeypatch):
+    """The worker must tick its heartbeat on its own even with nothing queued - otherwise an
+    idle-but-healthy worker would look indistinguishable from a hung one."""
+    monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+    monkeypatch.setattr("dm_mixer.audio.WORKER_QUEUE_POLL_SECONDS", 0.05)
+
+    class FakeHeartbeat:
+        value = 0.0
+
+    heartbeat = FakeHeartbeat()
+    q = queue.Queue()  # left empty on purpose, to force at least one idle tick
+
+    def stop_soon():
+        time.sleep(0.15)
+        q.put(None)
+
+    threading.Thread(target=stop_soon, daemon=True).start()
+    before = time.time()
+
+    pygame_worker_process(q, heartbeat)
+
+    assert heartbeat.value >= before
+
+
+# ---------------------------------------------------------------------------
 # Disk-write / callback failure resilience
 # ---------------------------------------------------------------------------
 

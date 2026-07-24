@@ -5,7 +5,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 from dm_mixer.utils import ensure_environment, load_keywords, effective_volume, CONFIG_FILE
-from dm_mixer.audio import AudioManager
+from dm_mixer.audio import AudioManager, WORKER_HEALTH_CHECK_INTERVAL_MS
 from dm_mixer.speech import TranscriptionEngine
 from dm_mixer.studio import SoundbankStudioController
 
@@ -64,6 +64,7 @@ class DMSoundApplication:
         
         self.sync_keyword_bank()
         self.animate_progress_clocks()
+        self.check_audio_worker_health()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def build_live_mixer_tab(self):
@@ -281,6 +282,14 @@ class DMSoundApplication:
             )
             
         self.root.after(100, self.animate_progress_clocks)
+
+    def check_audio_worker_health(self):
+        """Runs on a slow timer for the app's whole lifetime - a crashed/hung audio worker
+        would otherwise silently lose all audio for the rest of the session, with restarting
+        the whole app mid-table as the DM's only recourse."""
+        if self.audio_manager.check_worker_health(self.root, self.trigger_ui_refresh):
+            self.status_label.config(text="⚠️ Audio engine restarted after an unexpected failure", fg="#ffcc00")
+        self.root.after(WORKER_HEALTH_CHECK_INTERVAL_MS, self.check_audio_worker_health)
 
     def on_close(self):
         """Ensures the mic stream and the sandboxed audio worker process both shut down cleanly."""

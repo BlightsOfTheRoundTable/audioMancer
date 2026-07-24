@@ -13,7 +13,7 @@ def main():
         app = DMSoundApplication()
         app.run()
     except KeyboardInterrupt:
-        print("\n🛑 Execution terminated via console interrupt.")
+        print("\n[STOPPED] Execution terminated via console interrupt.")
         sys.exit(0)
 
 if __name__ == "__main__":
