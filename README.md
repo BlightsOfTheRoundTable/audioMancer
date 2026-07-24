@@ -21,6 +21,18 @@ Download the latest installer for your platform from the
 - A working microphone input device
 - Windows or macOS
 
+### Performance on lower-spec hardware
+
+Speech recognition runs locally on CPU. If keyword triggers feel slow to fire on older
+hardware, try a smaller Whisper model by setting an environment variable before launching:
+
+```bash
+DM_MIXER_WHISPER_MODEL=tiny dm-mixer
+```
+
+`tiny` is faster and lighter than the default `base` model, at some cost to transcription
+accuracy. No rebuild or reinstall needed - just set the variable before each launch.
+
 ## Setup (from source)
 
 This project uses [uv](https://docs.astral.sh/uv/) for dependency management. Requires
