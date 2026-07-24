@@ -183,8 +183,8 @@ def test_already_running_periodic_is_silently_skipped_without_reattempting_play(
         capsys.readouterr()  # discard the first pass's "Triggering" output
 
         _push_chunk(engine)
-        time.sleep(0.05)
-        assert len(audio_manager.play_calls) == 1  # not re-attempted
+        assert _wait_until(lambda: model.calls == 2)  # wait for the second pass to actually run...
+        assert len(audio_manager.play_calls) == 1  # ...before confirming it wasn't re-attempted
         assert "Skipped" not in capsys.readouterr().out
     finally:
         engine.is_running = False
