@@ -129,13 +129,20 @@ class TranscriptionEngine:
                 current_timestamp = time.time()
                 
                 if len(audio_buffer) >= self.whisper_target_rate * self.min_buffer_seconds:
+                    # Surfaced alongside every transcript specifically to help diagnose whether
+                    # a spurious keyword match came from a fresh utterance or from Whisper
+                    # re-interpreting the same still-growing buffer differently on a later
+                    # pass (the buffer is re-transcribed whole on every new mic chunk, not just
+                    # the new audio) - a buffer duration close to buffer_reset_seconds on a
+                    # nonsensical transcript is a strong sign of the latter.
+                    buffer_seconds = len(audio_buffer) / self.whisper_target_rate
                     try:
                         texts = self.recognizer.transcribe(audio_buffer)
                     except Exception: continue
 
                     for text in texts:
                         clean_text = text.lower().strip()
-                        print(f"\rHearing description: {text.strip()}", end="", flush=True)
+                        print(f"\rHearing description [{buffer_seconds:.1f}s buffer]: {text.strip()}", end="", flush=True)
 
                         # One spaCy parse per chunk, reused for every keyword checked against it -
                         # much cheaper than re-parsing the same sentence once per keyword.
@@ -171,6 +178,16 @@ class TranscriptionEngine:
                                 first_cues = context_analysis.analyze_occurrence(doc, matches[0].start(), matches[0].end())
                                 if first_cues.periodic_seconds is not None:
                                     unique_periodic_key = f"{keyword} @ every {int(first_cues.periodic_seconds)}s"
+                                    if unique_periodic_key in self.audio_manager.active_sounds:
+                                        # Being exempt from the cooldown gate (see above) means
+                                        # an already-running periodic phrase gets re-detected on
+                                        # every single re-transcription pass of the same still-
+                                        # growing buffer - without this, that's a fresh
+                                        # play()-and-reject-and-print cycle roughly every
+                                        # 0.1-0.25s until the buffer resets, spamming the console
+                                        # with "already active" for a loop that's working exactly
+                                        # as intended. Nothing to attempt or report here.
+                                        continue
                                     played = self.audio_manager.play(
                                         keyword=unique_periodic_key, file_info=file_info,
                                         on_ui_refresh_callback=self.on_keyword_triggered_callback,

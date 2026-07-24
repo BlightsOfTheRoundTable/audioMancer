@@ -127,7 +127,17 @@ def pygame_worker_process(command_queue, heartbeat=None):
 
                 existing = active_sounds.get(kw)
                 if existing and existing["channel"].get_busy():
-                    continue
+                    # get_busy() alone isn't enough: pygame channels are a shared pool, so once
+                    # a previous play of THIS keyword finishes, find_channel() is free to hand
+                    # that exact channel object to a completely different keyword's sound. The
+                    # stale reference above would then see "busy" and silently drop this play
+                    # request - the main process already updated the UI as "triggered" by this
+                    # point, so the DM sees it as playing while nothing actually sounds. Confirm
+                    # the channel is still busy WITH THIS KEYWORD'S OWN sound, not just busy.
+                    if existing["channel"].get_sound() is existing["sound"]:
+                        print(f"[WORKER] '{kw}': still playing on its channel - skipping replay")
+                        continue
+                    print(f"[WORKER] '{kw}': its old channel was reassigned to another sound - proceeding with a fresh channel")
 
                 try:
                     sound = pygame.mixer.Sound(file_path)

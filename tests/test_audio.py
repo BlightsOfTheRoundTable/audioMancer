@@ -293,7 +293,7 @@ def test_worker_survives_malformed_command_and_keeps_processing(tmp_path, monkey
     assert "[ERROR-AUDIO-WORKER]" in capsys.readouterr().err
 
 
-def test_worker_allows_replay_after_previous_oneshot_finishes(tmp_path, monkeypatch):
+def test_worker_allows_replay_after_previous_oneshot_finishes(tmp_path, monkeypatch, capsys):
     """Regression test for the periodic re-fire bug: the worker used to permanently mark a
     keyword as 'active' the moment it was first played, silently dropping every later replay
     of that same keyword even after the sound had long finished. It must now only block a
@@ -324,6 +324,7 @@ def test_worker_allows_replay_after_previous_oneshot_finishes(tmp_path, monkeypa
     q.put(dict(play_cmd))  # still busy -> must be dropped
     time.sleep(0.05)
     assert len(calls) == 1
+    assert "still playing on its channel - skipping replay" in capsys.readouterr().out
 
     time.sleep(0.25)  # let the ~150ms one-shot fully finish
 
@@ -333,6 +334,58 @@ def test_worker_allows_replay_after_previous_oneshot_finishes(tmp_path, monkeypa
 
     q.put(None)
     worker_thread.join(timeout=2)
+
+
+def test_worker_replays_a_keyword_whose_old_channel_was_reused_by_another_sound(tmp_path, monkeypatch, capsys):
+    """Regression test: existing["channel"].get_busy() alone can't tell "this keyword's own
+    sound is still playing" apart from "pygame reassigned this exact channel object to a
+    completely different sound after the original one finished." Channels are a shared pool -
+    once a keyword's playback finishes and its channel goes idle, find_channel() is free to
+    hand that same channel to a different keyword. A stale reference then sees "busy" and used
+    to silently drop the replay - the main process's UI already shows it as freshly triggered
+    by that point, so the DM sees no error, just no sound. Forcing a single channel guarantees
+    real reuse between two different keywords instead of hoping pygame picks the same one."""
+    monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+    original_set_num_channels = pygame.mixer.set_num_channels
+    monkeypatch.setattr(pygame.mixer, "set_num_channels", lambda _n: original_set_num_channels(1))
+
+    boom_path = tmp_path / "boom.wav"
+    _write_wav(boom_path, num_frames=int(8000 * 0.05), sample_rate=8000)  # ~50ms, finishes fast
+    thunder_path = tmp_path / "thunder.wav"
+    _write_wav(thunder_path, num_frames=8000 * 2, sample_rate=8000)  # long enough to still be busy
+
+    calls = []
+    original_find_channel = pygame.mixer.find_channel
+
+    def spy(*args, **kwargs):
+        result = original_find_channel(*args, **kwargs)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(pygame.mixer, "find_channel", spy)
+
+    q = queue.Queue()
+    worker_thread = threading.Thread(target=pygame_worker_process, args=(q,), daemon=True)
+    worker_thread.start()
+
+    q.put({"action": "play", "keyword": "boom", "file_path": str(boom_path), "one_shot": True, "base_volume": 0.5})
+    time.sleep(0.15)  # let "boom" finish and free the single shared channel
+    assert len(calls) == 1
+
+    q.put({"action": "play", "keyword": "thunder", "file_path": str(thunder_path), "one_shot": False, "base_volume": 0.5})
+    time.sleep(0.1)  # "thunder" claims the now-free channel and starts playing on it
+    assert len(calls) == 2
+
+    q.put({"action": "play", "keyword": "boom", "file_path": str(boom_path), "one_shot": True, "base_volume": 0.5})
+    time.sleep(0.1)
+
+    q.put(None)
+    worker_thread.join(timeout=2)
+
+    # The fix: boom's replay must actually be attempted (a 3rd find_channel call) rather than
+    # silently dropped just because its OLD channel object happens to be busy with thunder now.
+    assert len(calls) == 3
+    assert "its old channel was reassigned to another sound - proceeding" in capsys.readouterr().out
     assert not worker_thread.is_alive()
 
 
