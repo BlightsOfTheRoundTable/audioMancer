@@ -4,7 +4,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from dm_mixer.utils import ensure_environment, load_keywords, CONFIG_FILE
+from dm_mixer.utils import ensure_environment, load_keywords, effective_volume, CONFIG_FILE
 from dm_mixer.audio import AudioManager
 from dm_mixer.speech import TranscriptionEngine
 from dm_mixer.studio import SoundbankStudioController
@@ -225,8 +225,7 @@ class DMSoundApplication:
             sound_data["slider_widget"] = slider
             slider.bind("<MouseWheel>", _forward_wheel)
             
-            effective_volume = sound_data["base_volume"] * sound_data.get("context_volume_multiplier", 1.0)
-            scaled_percentage = int(max(0.0, min(1.0, effective_volume)) * self.audio_manager.master_scale * 100)
+            scaled_percentage = int(effective_volume(sound_data["base_volume"], sound_data.get("context_volume_multiplier", 1.0)) * self.audio_manager.master_scale * 100)
             progress_bar = ttk.Progressbar(row, orient="horizontal", length=60, mode="determinate", style="Horizontal.TProgressbar")
             progress_bar.config(maximum=100, value=scaled_percentage)
             progress_bar.pack(side="left", padx=(5, 10))

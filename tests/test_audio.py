@@ -258,7 +258,7 @@ def test_worker_skips_play_for_nonexistent_file(monkeypatch):
     assert calls == []
 
 
-def test_worker_survives_malformed_command_and_keeps_processing(tmp_path, monkeypatch):
+def test_worker_survives_malformed_command_and_keeps_processing(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
     wav_path = tmp_path / "blip.wav"
     _write_wav(wav_path, num_frames=8000 * 1, sample_rate=8000)
@@ -281,6 +281,9 @@ def test_worker_survives_malformed_command_and_keeps_processing(tmp_path, monkey
     pygame_worker_process(q)  # must not crash on the malformed command above
 
     assert len(calls) == 1
+    # Regression: this used to be a bare `except: pass` with zero diagnostic trail - a
+    # malformed command would go silent forever with the main process none the wiser.
+    assert "[ERROR-AUDIO-WORKER]" in capsys.readouterr().err
 
 
 def test_worker_allows_replay_after_previous_oneshot_finishes(tmp_path, monkeypatch):
@@ -668,7 +671,7 @@ def test_load_history_from_disk_reads_existing_file(monkeypatch, tmp_path):
     assert manager.volume_history == {"rain": 0.6}
 
 
-def test_load_history_from_disk_ignores_corrupt_file(monkeypatch, tmp_path):
+def test_load_history_from_disk_ignores_corrupt_file(monkeypatch, tmp_path, capsys):
     history_file = tmp_path / "volume_history.json"
     history_file.write_text("{ not valid json")
     monkeypatch.setattr("dm_mixer.audio.Queue", queue.Queue)
@@ -678,6 +681,7 @@ def test_load_history_from_disk_ignores_corrupt_file(monkeypatch, tmp_path):
     manager = AudioManager()  # must not raise
 
     assert manager.volume_history == {}
+    assert "[ERROR-AUDIO-HISTORY]" in capsys.readouterr().err
 
 
 def test_load_history_from_disk_ignores_empty_file(monkeypatch, tmp_path):
@@ -719,7 +723,7 @@ def test_shutdown_leaves_a_cleanly_exiting_worker_alone(audio_manager):
 # Disk-write / callback failure resilience
 # ---------------------------------------------------------------------------
 
-def test_stop_track_tolerates_history_write_failure(monkeypatch, audio_manager):
+def test_stop_track_tolerates_history_write_failure(monkeypatch, audio_manager, capsys):
     # Point HISTORY_FILE at a directory, so open(..., "w") raises IsADirectoryError/PermissionError
     monkeypatch.setattr("dm_mixer.audio.HISTORY_FILE", ".")
     audio_manager.active_sounds["rain"] = {"base_volume": 0.5}
@@ -727,22 +731,28 @@ def test_stop_track_tolerates_history_write_failure(monkeypatch, audio_manager):
     result = audio_manager.stop_track_with_gui_sync("rain", _recorder())  # must not raise
 
     assert result is True
+    # Regression: a DM's saved volume levels used to be able to silently fail to persist on
+    # every session close with zero indication anything went wrong.
+    assert "[ERROR-AUDIO-HISTORY]" in capsys.readouterr().err
 
 
-def test_stop_all_tolerates_history_write_failure(monkeypatch, audio_manager):
+def test_stop_all_tolerates_history_write_failure(monkeypatch, audio_manager, capsys):
     monkeypatch.setattr("dm_mixer.audio.HISTORY_FILE", ".")
     audio_manager.active_sounds["rain"] = {"base_volume": 0.5}
 
     audio_manager.stop_all_sounds_with_fade(save_history_callback=None)  # must not raise
 
     assert audio_manager.active_sounds == {}
+    assert "[ERROR-AUDIO-HISTORY]" in capsys.readouterr().err
 
 
-def test_stop_all_tolerates_save_history_callback_exception(audio_manager):
+def test_stop_all_tolerates_save_history_callback_exception(audio_manager, capsys):
     def exploding_callback():
         raise RuntimeError("UI teardown failed")
 
     audio_manager.stop_all_sounds_with_fade(save_history_callback=exploding_callback)  # must not raise
+
+    assert "[ERROR-AUDIO-CALLBACK]" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +781,7 @@ def test_worker_falls_back_to_dummy_driver_when_no_real_device_available(monkeyp
     assert attempts[-1] == "dummy"
 
 
-def test_shutdown_tolerates_queue_put_failure(audio_manager):
+def test_shutdown_tolerates_queue_put_failure(audio_manager, capsys):
     def raising_put(_value):
         raise RuntimeError("queue is closed")
 
@@ -780,9 +790,10 @@ def test_shutdown_tolerates_queue_put_failure(audio_manager):
     audio_manager.shutdown()  # must not raise despite the put() failure
 
     assert audio_manager.worker.is_alive() is False
+    assert "[ERROR-AUDIO-SHUTDOWN]" in capsys.readouterr().err
 
 
-def test_play_one_shot_tolerates_stale_timer_cancel_failure(audio_manager, tmp_path):
+def test_play_one_shot_tolerates_stale_timer_cancel_failure(audio_manager, tmp_path, capsys):
     class RaisingAfterCancelRoot(FakeRoot):
         def after_cancel(self, task_id):
             raise RuntimeError("timer already gone")
@@ -797,10 +808,15 @@ def test_play_one_shot_tolerates_stale_timer_cancel_failure(audio_manager, tmp_p
     )
 
     assert result is True
+    # Regression: this was the one remaining bare `except: pass` after the batch-1 sweep,
+    # spotted in review - play() runs on speech.py's background thread, not the Tk main
+    # thread, so a failure here can be a genuine cross-thread Tk issue, not just a harmless
+    # stale timer id, and deserves the same logging as every other site now.
+    assert "[ERROR-AUDIO-TIMER]" in capsys.readouterr().err
     assert "boom" in audio_manager.active_sounds
 
 
-def test_worker_logs_and_continues_when_sound_construction_fails(tmp_path, monkeypatch):
+def test_worker_logs_and_continues_when_sound_construction_fails(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
     bogus_path = tmp_path / "not_really_audio.wav"
     bogus_path.write_bytes(b"this is not valid audio data at all")
@@ -810,3 +826,5 @@ def test_worker_logs_and_continues_when_sound_construction_fails(tmp_path, monke
     q.put(None)
 
     pygame_worker_process(q)  # must not crash; the bad Sound() call is caught and logged
+
+    assert "[ERROR-AUDIO-WORKER] Failed playing" in capsys.readouterr().err
