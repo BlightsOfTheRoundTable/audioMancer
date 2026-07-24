@@ -1,14 +1,27 @@
 import os
 import json
 import platform
+import queue
 import re
 import sys
 import pygame
 import time
 import struct
 import traceback
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Value
 from dm_mixer.utils import calculate_gains, effective_volume, HISTORY_FILE
+
+# How often the worker wakes up on its own even with nothing queued, so its heartbeat still
+# advances while genuinely idle - without this, an idle-but-healthy worker would look "stuck"
+# to the health check below just from having no commands to process.
+WORKER_QUEUE_POLL_SECONDS = 1.0
+
+# How stale the heartbeat can get before the worker is considered hung, not just quiet. Must
+# stay comfortably above WORKER_QUEUE_POLL_SECONDS so a healthy-but-idle worker never trips it.
+HEARTBEAT_STALE_SECONDS = 5.0
+
+# How often AudioManager.check_worker_health() should be polled by the caller (app.py).
+WORKER_HEALTH_CHECK_INTERVAL_MS = 2000
 
 def get_audio_file_duration(file_path):
     """Extracts absolute playback length in seconds by walking the RIFF chunk table."""
@@ -57,8 +70,12 @@ def _base_keyword(keyword):
     base = keyword.split(" @")[0]
     return re.sub(r" #\d+-\d+$", "", base)
 
-def pygame_worker_process(command_queue):
-    """A completely isolated hardware worker process running the Pygame mixer sandbox."""
+def pygame_worker_process(command_queue, heartbeat=None):
+    """A completely isolated hardware worker process running the Pygame mixer sandbox.
+
+    heartbeat, if given, is a multiprocessing.Value('d', ...) updated on every loop tick -
+    including idle ticks where nothing was queued - so AudioManager.check_worker_health() can
+    tell a merely-idle worker apart from one that's actually hung."""
     if platform.system() == "Windows" and "SDL_AUDIODRIVER" not in os.environ:
         # DirectSound avoids exclusive-mode WASAPI collisions with the sounddevice mic stream.
         # macOS (CoreAudio) and Linux don't have this collision, so let SDL pick its own default there.
@@ -81,7 +98,16 @@ def pygame_worker_process(command_queue):
     
     while True:
         try:
-            cmd = command_queue.get()
+            try:
+                cmd = command_queue.get(timeout=WORKER_QUEUE_POLL_SECONDS)
+            except queue.Empty:
+                if heartbeat is not None:
+                    heartbeat.value = time.time()
+                continue
+
+            if heartbeat is not None:
+                heartbeat.value = time.time()
+
             if cmd is None:
                 for sound_data in active_sounds.values():
                     sound_data["channel"].stop()
@@ -109,14 +135,14 @@ def pygame_worker_process(command_queue):
                     if channel:
                         final_volume = calculate_gains(base_vol, master_scale)
                         channel.set_volume(final_volume)
-                        print(f"🔊 [WORKER] '{kw}': channel.set_volume({final_volume:.3f}) = base_volume({base_vol:.3f}) x master_scale({master_scale:.3f}); channel reports back {channel.get_volume():.3f}")
+                        print(f"[WORKER] '{kw}': channel.set_volume({final_volume:.3f}) = base_volume({base_vol:.3f}) x master_scale({master_scale:.3f}); channel reports back {channel.get_volume():.3f}")
                         if one_shot:
                             channel.play(sound, loops=0)
                         else:
                             channel.play(sound, loops=-1)
                         active_sounds[kw] = {"channel": channel, "sound": sound, "base_volume": base_vol}
                 except Exception:
-                    print(f"\n❌ [ERROR-AUDIO-WORKER] Failed playing {file_path!r}:", file=sys.stderr)
+                    print(f"\n[ERROR-AUDIO-WORKER] Failed playing {file_path!r}:", file=sys.stderr)
                     traceback.print_exc()
 
             elif action == "update_master":
@@ -165,11 +191,74 @@ class AudioManager:
         
         self.volume_history = {}
         self.load_history_from_disk()
-        
+
+        self.command_queue = None
+        self.heartbeat = None
+        self.worker = None
+        self._spawn_worker()
+
+    def _spawn_worker(self):
+        """Creates a fresh command queue, heartbeat, and worker process. Used both at startup
+        and by check_worker_health() to replace a dead/hung worker without reusing any of its
+        possibly-corrupted state."""
         self.command_queue = Queue()
-        self.worker = Process(target=pygame_worker_process, args=(self.command_queue,), daemon=True)
+        self.heartbeat = Value('d', time.time())
+        self.worker = Process(target=pygame_worker_process, args=(self.command_queue, self.heartbeat), daemon=True)
         self.worker.start()
-        print("🔊 AudioManager Sandboxed Worker Process spawned successfully.")
+        print("[AUDIO] AudioManager Sandboxed Worker Process spawned successfully.")
+
+    def check_worker_health(self, root_window_widget, on_ui_refresh_callback):
+        """Detects a crashed or hung worker process and transparently restarts it, resuming
+        any active background loops. Without this, a dead worker would silently lose all audio
+        for the rest of the session, with restarting the whole app mid-table as the only fix.
+        Returns True if a restart happened, so the caller can surface it to the DM."""
+        worker_dead = not self.worker.is_alive()
+        worker_hung = not worker_dead and (time.time() - self.heartbeat.value) > HEARTBEAT_STALE_SECONDS
+        if not worker_dead and not worker_hung:
+            return False
+
+        reason = "crashed" if worker_dead else "stopped responding"
+        print(f"\n[ERROR-AUDIO-WORKER] Worker process {reason} - restarting and resuming active loops.", file=sys.stderr)
+
+        if self.worker.is_alive():
+            # Escalate straight to kill() rather than terminate() - a hung worker may be
+            # ignoring SIGTERM (terminate()'s signal on POSIX; the two are identical on
+            # Windows, which has no signal distinction of its own). Spawning a replacement
+            # before this one is confirmed dead risks two processes holding the audio device
+            # at once, and leaves the old one's handle orphaned and untracked the moment
+            # self.worker gets reassigned to the new process below.
+            try:
+                self.worker.kill()
+                self.worker.join(timeout=1.0)
+            except Exception:
+                print("\n[ERROR-AUDIO-WORKER] Trouble tearing down the old worker before restart:", file=sys.stderr)
+                traceback.print_exc()
+
+            if self.worker.is_alive():
+                print("\n[ERROR-AUDIO-WORKER] Old worker process would not die - spawning a replacement anyway; the audio device may be briefly contended.", file=sys.stderr)
+
+        self._spawn_worker()
+
+        # Restore the DM's master volume before resuming anything - a fresh worker starts at
+        # master_scale=1.0, which would make resumed loops jump to the wrong level.
+        self.command_queue.put({"action": "update_master", "value": self.master_scale})
+
+        # Only resume background loops. One-shots are momentary - replaying one late (however
+        # long "late" turns out to be) would be the wrong sound at the wrong time. Periodic
+        # re-fires resume on their own next scheduled tick without help, since
+        # execute_periodic_fire() reads self.command_queue fresh each call rather than
+        # capturing a reference to the (now-replaced) old one.
+        for keyword, sound_data in list(self.active_sounds.items()):
+            if sound_data.get("is_one_shot") or sound_data.get("is_periodic"):
+                continue
+            file_path = sound_data.get("file_path")
+            if not file_path or not os.path.exists(file_path):
+                continue
+            send_volume = effective_volume(sound_data["base_volume"], sound_data.get("context_volume_multiplier", 1.0))
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": False, "base_volume": send_volume})
+
+        on_ui_refresh_callback()
+        return True
 
     def shutdown(self):
         """Gracefully stops the sandboxed worker process on application exit."""
@@ -187,7 +276,7 @@ class AudioManager:
             try:
                 with open(HISTORY_FILE, "r") as f:
                     self.volume_history = json.load(f)
-                print(f"💾 AudioManager loaded volume balances for {len(self.volume_history)} assets.")
+                print(f"[AUDIO] AudioManager loaded volume balances for {len(self.volume_history)} assets.")
             except Exception:
                 print("\n[ERROR-AUDIO-HISTORY] Could not load history file:", file=sys.stderr)
                 traceback.print_exc()
@@ -209,7 +298,7 @@ class AudioManager:
 
         target_base_volume = self.volume_history.get(_base_keyword(keyword), 0.5)
         send_volume = effective_volume(target_base_volume, context_volume_multiplier)
-        print(f"🎚️  '{keyword}': base_volume={target_base_volume:.3f} x context_multiplier={context_volume_multiplier:.3f} = effective_volume={send_volume:.3f} (sent to worker, before master scale)")
+        print(f"[VOLUME] '{keyword}': base_volume={target_base_volume:.3f} x context_multiplier={context_volume_multiplier:.3f} = effective_volume={send_volume:.3f} (sent to worker, before master scale)")
 
         # FIX: Extract duration via high-performance structural binary scraping instead of Pygame init!
         duration_seconds = get_audio_file_duration(file_path) if periodic_interval is None else periodic_interval
@@ -217,7 +306,7 @@ class AudioManager:
 
         if periodic_interval is not None:
             self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": send_volume})
-            self.active_sounds[keyword] = {"base_volume": target_base_volume, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": False, "is_periodic": True, "duration": periodic_interval, "start_time": start_time}
+            self.active_sounds[keyword] = {"base_volume": target_base_volume, "file_path": file_path, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": False, "is_periodic": True, "duration": periodic_interval, "start_time": start_time}
             on_ui_refresh_callback()
             self.schedule_next_periodic_pass(keyword, file_info, periodic_interval, on_ui_refresh_callback, root_window_widget)
             return True
@@ -236,7 +325,7 @@ class AudioManager:
                     traceback.print_exc()
 
             self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": send_volume})
-            self.active_sounds[keyword] = {"base_volume": target_base_volume, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": True, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
+            self.active_sounds[keyword] = {"base_volume": target_base_volume, "file_path": file_path, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": True, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
             on_ui_refresh_callback()
 
             duration_ms = int(duration_seconds * 1000) + 200
@@ -244,7 +333,7 @@ class AudioManager:
             self.one_shot_timers[keyword] = task_id
         else:
             self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": False, "base_volume": send_volume})
-            self.active_sounds[keyword] = {"base_volume": target_base_volume, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": False, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
+            self.active_sounds[keyword] = {"base_volume": target_base_volume, "file_path": file_path, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": False, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
             on_ui_refresh_callback()
         return True
 

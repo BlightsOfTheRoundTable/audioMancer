@@ -305,8 +305,9 @@ class SoundbankStudioController(tk.Frame):
                                     command=lambda p=path: self.delete_sound_asset(p))
                 del_btn.pack(side="left")
                 
-        except Exception as e:
-            print(f"⚠️ Error drawing grid: {e}")
+        except Exception:
+            print("\n[ERROR-STUDIO-GRID] Error drawing library inventory grid:", file=sys.stderr)
+            traceback.print_exc()
 
     def delete_sound_asset(self, target_path):
         if messagebox.askyesno("Delete Sound Asset", f"Permanently remove this audio track?"):

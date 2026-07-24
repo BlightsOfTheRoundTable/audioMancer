@@ -48,10 +48,10 @@ class TranscriptionEngine:
         self.min_buffer_seconds = 3.5
         self.buffer_reset_seconds = 7.0
 
-        print("⏳ Loading Whisper model into memory... (This takes a moment)")
+        print("[LOADING] Loading Whisper model into memory... (This takes a moment)")
         self.model = WhisperModel("base", device="cpu", compute_type="int8")
 
-        print("⏳ Loading spaCy language model for context analysis...")
+        print("[LOADING] Loading spaCy language model for context analysis...")
         context_analysis.get_nlp()
 
     def audio_callback(self, indata, frames, time_info, status):
@@ -135,7 +135,7 @@ class TranscriptionEngine:
                     
                     for segment in segments:
                         clean_text = segment.text.lower().strip()
-                        print(f"\r💬 Hearing description: {segment.text.strip()}", end="", flush=True)
+                        print(f"\rHearing description: {segment.text.strip()}", end="", flush=True)
 
                         # One spaCy parse per chunk, reused for every keyword checked against it -
                         # much cheaper than re-parsing the same sentence once per keyword.
@@ -179,9 +179,9 @@ class TranscriptionEngine:
                                         context_modifier_word=first_cues.volume_modifier_word,
                                     )
                                     if played:
-                                        print(f"\n🔁 Triggering {_describe_trigger(keyword, periodic_seconds=first_cues.periodic_seconds, volume_multiplier=first_cues.volume_multiplier, volume_modifier_word=first_cues.volume_modifier_word)}")
+                                        print(f"\nTriggering {_describe_trigger(keyword, periodic_seconds=first_cues.periodic_seconds, volume_multiplier=first_cues.volume_multiplier, volume_modifier_word=first_cues.volume_modifier_word)}")
                                     else:
-                                        print(f"\n⏭️  Skipped '{keyword}' (every {int(first_cues.periodic_seconds)}s) - already active")
+                                        print(f"\nSkipped '{keyword}' (every {int(first_cues.periodic_seconds)}s) - already active")
                                     continue
 
                                 if keyword in phrase_cooldowns and current_timestamp - phrase_cooldowns[keyword] < 4.0:
@@ -209,7 +209,7 @@ class TranscriptionEngine:
                                 fire_count = min(15, fire_count)
 
                                 if file_info["one_shot"] and fire_count > 1:
-                                    print(f"\n⚡ Triggering {_describe_trigger(keyword, fire_count=fire_count, volume_multiplier=volume_multiplier, volume_modifier_word=volume_modifier_word)}")
+                                    print(f"\nTriggering {_describe_trigger(keyword, fire_count=fire_count, volume_multiplier=volume_multiplier, volume_modifier_word=volume_modifier_word)}")
                                     volley_id = str(int(time.time() * 100))[-3:]
 
                                     def dispatch_burst(total_shots, kw, info, callback, widget, group_id, vol_multiplier, vol_word):
@@ -222,7 +222,7 @@ class TranscriptionEngine:
                                                 context_modifier_word=vol_word,
                                             )
                                             if not played:
-                                                print(f"\n⏭️  Skipped burst shot {shot + 1}/{total_shots} for '{kw}' - already active")
+                                                print(f"\nSkipped burst shot {shot + 1}/{total_shots} for '{kw}' - already active")
                                             time.sleep(random.uniform(0.15, 0.45))
 
                                     threading.Thread(
@@ -239,9 +239,9 @@ class TranscriptionEngine:
                                         context_modifier_word=volume_modifier_word,
                                     )
                                     if played:
-                                        print(f"\n🔊 Triggering {_describe_trigger(keyword, volume_multiplier=volume_multiplier, volume_modifier_word=volume_modifier_word)}")
+                                        print(f"\nTriggering {_describe_trigger(keyword, volume_multiplier=volume_multiplier, volume_modifier_word=volume_modifier_word)}")
                                     else:
-                                        print(f"\n⏭️  Skipped '{keyword}' - already active/playing")
+                                        print(f"\nSkipped '{keyword}' - already active/playing")
                             except Exception:
                                 # Never let one keyword's analysis take down the whole listening
                                 # session - log it and keep checking the REST of the keywords
