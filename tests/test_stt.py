@@ -65,3 +65,24 @@ def test_transcribe_returns_plain_text_not_segment_objects():
     result = recognizer.transcribe("fake-audio-buffer")
 
     assert result == ["hello", "world"]
+    # Locks in the actual parameters sent to the backend, not just the unwrapped return shape -
+    # a change to beam_size/vad_filter/language here would otherwise pass silently.
+    audio_buffer, kwargs = recognizer.model.transcribe_call
+    assert audio_buffer == "fake-audio-buffer"
+    assert kwargs == {"beam_size": 3, "vad_filter": True, "language": "en"}
+
+
+def test_speech_recognizer_raises_a_clear_error_on_invalid_model_size(monkeypatch):
+    original_error = ValueError("unknown model size")
+
+    def raising_whisper_model(model_size, **kwargs):
+        raise original_error
+
+    monkeypatch.setattr(stt, "WhisperModel", raising_whisper_model)
+
+    with pytest.raises(RuntimeError, match="Failed to load Whisper model 'bogus'") as exc_info:
+        stt.SpeechRecognizer(model_size="bogus")
+
+    # The original error is preserved as the cause, not swallowed - still visible for
+    # debugging even though the top-level message is now actionable.
+    assert exc_info.value.__cause__ is original_error

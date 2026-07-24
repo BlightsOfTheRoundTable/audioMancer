@@ -27,7 +27,17 @@ def resolve_model_size(explicit=None):
 class SpeechRecognizer:
     def __init__(self, model_size=None):
         self.model_size = resolve_model_size(model_size)
-        self.model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
+        try:
+            self.model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
+        except Exception as e:
+            # A typo'd DM_MIXER_WHISPER_MODEL would otherwise surface as whatever internal
+            # error ctranslate2/faster-whisper happens to raise for an unrecognized model
+            # name - not obviously connected to the env var that caused it, especially since
+            # this fails during startup before any UI exists to explain it.
+            raise RuntimeError(
+                f"Failed to load Whisper model '{self.model_size}'. "
+                "Check DM_MIXER_WHISPER_MODEL (unset it to use the default) or provide a valid model size/path."
+            ) from e
 
     def transcribe(self, audio_buffer):
         """Returns the recognized text of each detected speech segment, in order."""
