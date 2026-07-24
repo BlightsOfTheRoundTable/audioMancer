@@ -162,6 +162,35 @@ def test_skipped_periodic_play_logs_instead_of_claiming_success(engine_factory, 
         thread.join(timeout=2)
 
 
+def test_already_running_periodic_is_silently_skipped_without_reattempting_play(engine_factory, capsys):
+    """Regression test: periodic detection is deliberately exempt from the cooldown gate (see
+    speech.py), so once a periodic loop is genuinely running, the exact same still-unchanged
+    phrase gets re-detected on every single re-transcription pass of the same growing buffer -
+    roughly every 0.1-0.25s until the buffer resets. That used to mean a fresh play()-and-
+    reject-and-print cycle each time, spamming the console with "already active" for a loop
+    that's working exactly as intended. Once it's confirmed active, later re-detections must
+    not even attempt play() again."""
+    engine, audio_manager, model = engine_factory({
+        "thunder": {"file_path": "sounds/thunder.wav", "one_shot": True},
+    })
+    model.queue_response(["thunder rumbles every 8 seconds"])
+    model.queue_response(["thunder rumbles every 8 seconds"])  # same phrase, re-detected again
+
+    thread = _run_and_stop(engine)
+    try:
+        _push_chunk(engine)
+        assert _wait_until(lambda: len(audio_manager.play_calls) == 1)
+        capsys.readouterr()  # discard the first pass's "Triggering" output
+
+        _push_chunk(engine)
+        assert _wait_until(lambda: model.calls == 2)  # wait for the second pass to actually run...
+        assert len(audio_manager.play_calls) == 1  # ...before confirming it wasn't re-attempted
+        assert "Skipped" not in capsys.readouterr().out
+    finally:
+        engine.is_running = False
+        thread.join(timeout=2)
+
+
 def test_skipped_burst_shot_logs_instead_of_silently_dropping(engine_factory, monkeypatch, capsys):
     engine, audio_manager, model = engine_factory({
         "arrow": {"file_path": "sounds/arrow.wav", "one_shot": True},
