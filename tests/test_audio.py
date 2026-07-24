@@ -82,6 +82,7 @@ class FakeProcess:
         self.hangs = hangs
         self._alive = False
         self.terminated = False
+        self.killed = False
 
     def start(self):
         self._alive = True
@@ -95,7 +96,13 @@ class FakeProcess:
 
     def terminate(self):
         self.terminated = True
-        self._alive = False
+        if not self.hangs:
+            self._alive = False
+
+    def kill(self):
+        self.killed = True
+        if not self.hangs:
+            self._alive = False
 
 
 @pytest.fixture
@@ -765,19 +772,55 @@ def test_check_worker_health_restarts_a_hung_worker(audio_manager, capsys):
     assert "stopped responding" in capsys.readouterr().err
 
 
-def test_check_worker_health_tolerates_teardown_failure_and_still_restarts(audio_manager, capsys):
-    audio_manager.worker._alive = False
+def test_check_worker_health_kills_rather_than_just_terminates_a_hung_worker(audio_manager):
+    """A hung worker may be ignoring terminate()'s SIGTERM outright - escalate straight to
+    kill() (SIGKILL on POSIX, identical to terminate() on Windows) rather than hoping."""
+    old_worker = audio_manager.worker
+    audio_manager.heartbeat.value = time.time() - 999
 
-    def raising_terminate():
+    audio_manager.check_worker_health(FakeRoot(), _recorder())
+
+    assert old_worker.killed is True
+
+
+def test_check_worker_health_skips_kill_when_worker_is_already_dead(audio_manager):
+    """No point signaling a process that's already gone - and multiprocessing.Process.kill()
+    on an already-exited process is the kind of thing worth not relying on being harmless."""
+    old_worker = audio_manager.worker
+    old_worker._alive = False  # simulate a crash
+
+    audio_manager.check_worker_health(FakeRoot(), _recorder())
+
+    assert old_worker.killed is False
+
+
+def test_check_worker_health_tolerates_teardown_failure_and_still_restarts(audio_manager, capsys):
+    audio_manager.heartbeat.value = time.time() - 999  # hung, not dead - "dead" skips kill() entirely
+
+    def raising_kill():
         raise RuntimeError("process handle already gone")
 
-    audio_manager.worker.terminate = raising_terminate
+    audio_manager.worker.kill = raising_kill
 
     result = audio_manager.check_worker_health(FakeRoot(), _recorder())
 
     assert result is True
     assert audio_manager.worker.is_alive() is True  # a fresh worker still gets spawned
     assert "Trouble tearing down" in capsys.readouterr().err
+
+
+def test_check_worker_health_warns_when_old_worker_will_not_die(audio_manager, capsys):
+    """Spawning a replacement while the old one might still be holding the audio device is a
+    known, accepted risk (SIGKILL essentially never fails in practice) - but it must be logged
+    loudly rather than silently proceeding as if nothing unusual happened."""
+    audio_manager.heartbeat.value = time.time() - 999
+    audio_manager.worker.hangs = True  # even kill()/join() won't clear is_alive()
+
+    result = audio_manager.check_worker_health(FakeRoot(), _recorder())
+
+    assert result is True  # a replacement is still spawned
+    assert audio_manager.worker.is_alive() is True  # the NEW worker, not the stuck old one
+    assert "would not die" in capsys.readouterr().err
 
 
 def test_check_worker_health_resumes_active_background_loops(audio_manager, tmp_path):

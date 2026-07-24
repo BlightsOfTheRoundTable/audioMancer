@@ -220,12 +220,22 @@ class AudioManager:
         reason = "crashed" if worker_dead else "stopped responding"
         print(f"\n[ERROR-AUDIO-WORKER] Worker process {reason} - restarting and resuming active loops.", file=sys.stderr)
 
-        try:
-            self.worker.terminate()
-            self.worker.join(timeout=1.0)
-        except Exception:
-            print("\n[ERROR-AUDIO-WORKER] Trouble tearing down the old worker before restart:", file=sys.stderr)
-            traceback.print_exc()
+        if self.worker.is_alive():
+            # Escalate straight to kill() rather than terminate() - a hung worker may be
+            # ignoring SIGTERM (terminate()'s signal on POSIX; the two are identical on
+            # Windows, which has no signal distinction of its own). Spawning a replacement
+            # before this one is confirmed dead risks two processes holding the audio device
+            # at once, and leaves the old one's handle orphaned and untracked the moment
+            # self.worker gets reassigned to the new process below.
+            try:
+                self.worker.kill()
+                self.worker.join(timeout=1.0)
+            except Exception:
+                print("\n[ERROR-AUDIO-WORKER] Trouble tearing down the old worker before restart:", file=sys.stderr)
+                traceback.print_exc()
+
+            if self.worker.is_alive():
+                print("\n[ERROR-AUDIO-WORKER] Old worker process would not die - spawning a replacement anyway; the audio device may be briefly contended.", file=sys.stderr)
 
         self._spawn_worker()
 
