@@ -224,8 +224,16 @@ class AudioManager:
 
         if file_info["one_shot"]:
             if keyword in self.one_shot_timers:
-                try: root_window_widget.after_cancel(self.one_shot_timers[keyword])
-                except Exception: pass
+                try:
+                    root_window_widget.after_cancel(self.one_shot_timers[keyword])
+                except Exception:
+                    # play() is called from speech.py's background listening thread, not the
+                    # Tk main thread, so this isn't just "stale timer id" (Tcl's `after cancel`
+                    # is a documented no-op for that case) - it can also be a genuine cross-
+                    # thread Tk call failing. Not fatal either way (the stale timer firing late
+                    # is harmless), but worth logging rather than swallowing blind.
+                    print(f"\n[ERROR-AUDIO-TIMER] Could not cancel prior timer for {keyword!r}:", file=sys.stderr)
+                    traceback.print_exc()
 
             self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": send_volume})
             self.active_sounds[keyword] = {"base_volume": target_base_volume, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": True, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}

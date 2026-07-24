@@ -793,7 +793,7 @@ def test_shutdown_tolerates_queue_put_failure(audio_manager, capsys):
     assert "[ERROR-AUDIO-SHUTDOWN]" in capsys.readouterr().err
 
 
-def test_play_one_shot_tolerates_stale_timer_cancel_failure(audio_manager, tmp_path):
+def test_play_one_shot_tolerates_stale_timer_cancel_failure(audio_manager, tmp_path, capsys):
     class RaisingAfterCancelRoot(FakeRoot):
         def after_cancel(self, task_id):
             raise RuntimeError("timer already gone")
@@ -808,6 +808,11 @@ def test_play_one_shot_tolerates_stale_timer_cancel_failure(audio_manager, tmp_p
     )
 
     assert result is True
+    # Regression: this was the one remaining bare `except: pass` after the batch-1 sweep,
+    # spotted in review - play() runs on speech.py's background thread, not the Tk main
+    # thread, so a failure here can be a genuine cross-thread Tk issue, not just a harmless
+    # stale timer id, and deserves the same logging as every other site now.
+    assert "[ERROR-AUDIO-TIMER]" in capsys.readouterr().err
     assert "boom" in audio_manager.active_sounds
 
 
