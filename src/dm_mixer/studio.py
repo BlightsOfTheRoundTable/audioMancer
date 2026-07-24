@@ -1,6 +1,8 @@
 import os
 import json
 import shutil
+import sys
+import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from dm_mixer.utils import USER_SOUNDS_DIR, CONFIG_FILE
@@ -232,7 +234,11 @@ class SoundbankStudioController(tk.Frame):
                             if os.path.exists(self.editing_path):
                                 os.remove(self.editing_path)
                         except Exception:
-                            pass
+                            # Non-fatal: the new file already copied successfully, so the edit
+                            # itself must still go through - just log why the old one was left
+                            # behind instead of silently leaving stale audio files on disk.
+                            print(f"\n[ERROR-STUDIO-CLEANUP] Could not remove old asset {self.editing_path!r}:", file=sys.stderr)
+                            traceback.print_exc()
                     final_path = dest_path
                 else:
                     final_path = self.editing_path

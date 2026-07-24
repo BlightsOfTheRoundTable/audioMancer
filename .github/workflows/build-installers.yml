@@ -54,8 +54,17 @@ jobs:
         # Uses pwsh, not bash, specifically to avoid Git-Bash-on-Windows mangling the /D flag
         # as a path (confirmed locally: iscc rejected "/DMyAppVersion=..." under bash until
         # escaped, which pwsh doesn't need).
+        #
+        # pwsh does NOT fail a step just because an external .exe returns a non-zero exit
+        # code - only actual PowerShell errors do. Without the explicit check below, a real
+        # ISCC failure (e.g. Chocolatey installing to a different path than expected) would
+        # report this step as green while producing no installer at all.
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows\installer.iss "/DMyAppVersion=${{ steps.version.outputs.value }}"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "ISCC.exe exited with code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
 
       - name: Upload Windows installer
         if: matrix.platform == 'windows'
@@ -63,6 +72,7 @@ jobs:
         with:
           name: windows-installer
           path: packaging/windows/Output/*.exe
+          if-no-files-found: error
 
       - name: Build macOS disk image
         if: matrix.platform == 'macos'
@@ -76,6 +86,7 @@ jobs:
         with:
           name: macos-installer
           path: "*.dmg"
+          if-no-files-found: error
 
   release:
     needs: build

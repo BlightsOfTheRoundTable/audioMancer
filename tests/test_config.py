@@ -1,4 +1,4 @@
-from dm_mixer.utils import calculate_gains, load_keywords, ensure_environment
+from dm_mixer.utils import calculate_gains, effective_volume, load_keywords, ensure_environment
 import json
 import os
 
@@ -7,6 +7,23 @@ def test_relative_volume_calculation():
     assert calculate_gains(1.0, 0.5) == 0.50
     assert calculate_gains(0.8, 0.5) == 0.40
     assert calculate_gains(0.5, 0.0) == 0.00
+
+
+def test_effective_volume_multiplies_base_and_context_multiplier():
+    assert effective_volume(0.8, 0.5) == 0.4
+
+
+def test_effective_volume_defaults_context_multiplier_to_neutral():
+    assert effective_volume(0.6) == 0.6
+
+
+def test_effective_volume_clamps_at_upper_bound():
+    assert effective_volume(0.9, 1.5) == 1.0  # 0.9 * 1.5 = 1.35, must clamp
+
+
+def test_effective_volume_clamps_at_lower_bound():
+    assert effective_volume(0.5, -1.0) == 0.0  # defensive: multiplier should never go negative in
+    # practice (VOLUME_MULTIPLIER_MIN prevents it), but the clamp must hold regardless
 
 def test_config_parsing_logic(tmp_path, monkeypatch):
     """Mocks a config file to verify loop vs one-shot classifications work."""

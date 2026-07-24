@@ -2,11 +2,13 @@ import os
 import json
 import platform
 import re
+import sys
 import pygame
 import time
 import struct
+import traceback
 from multiprocessing import Process, Queue
-from dm_mixer.utils import calculate_gains, HISTORY_FILE
+from dm_mixer.utils import calculate_gains, effective_volume, HISTORY_FILE
 
 def get_audio_file_duration(file_path):
     """Extracts absolute playback length in seconds by walking the RIFF chunk table."""
@@ -113,9 +115,10 @@ def pygame_worker_process(command_queue):
                         else:
                             channel.play(sound, loops=-1)
                         active_sounds[kw] = {"channel": channel, "sound": sound, "base_volume": base_vol}
-                except Exception as e:
-                    print(f"\n❌ Worker error playing {file_path}: {e}")
-                    
+                except Exception:
+                    print(f"\n❌ [ERROR-AUDIO-WORKER] Failed playing {file_path!r}:", file=sys.stderr)
+                    traceback.print_exc()
+
             elif action == "update_master":
                 master_scale = cmd["value"]
                 for sound_data in active_sounds.values():
@@ -146,7 +149,12 @@ def pygame_worker_process(command_queue):
                 active_sounds.clear()
                 
         except Exception:
-            pass
+            # A malformed/unexpected command must not kill the worker process outright - the
+            # main process would keep queuing commands into it with no way to know it died,
+            # silently losing all audio for the rest of the session. Log and keep processing
+            # the next command instead.
+            print("\n[ERROR-AUDIO-WORKER] Unexpected error processing a command:", file=sys.stderr)
+            traceback.print_exc()
 
 class AudioManager:
     def __init__(self):
@@ -168,7 +176,8 @@ class AudioManager:
         try:
             self.command_queue.put(None)
         except Exception:
-            pass
+            print("\n[ERROR-AUDIO-SHUTDOWN] Could not signal worker to stop:", file=sys.stderr)
+            traceback.print_exc()
         self.worker.join(timeout=2)
         if self.worker.is_alive():
             self.worker.terminate()
@@ -179,8 +188,9 @@ class AudioManager:
                 with open(HISTORY_FILE, "r") as f:
                     self.volume_history = json.load(f)
                 print(f"💾 AudioManager loaded volume balances for {len(self.volume_history)} assets.")
-            except Exception as e:
-                print(f"⚠️ Could not load history file: {e}")
+            except Exception:
+                print("\n[ERROR-AUDIO-HISTORY] Could not load history file:", file=sys.stderr)
+                traceback.print_exc()
 
     def play(self, keyword, file_info, on_ui_refresh_callback, root_window_widget, periodic_interval=None, context_volume_multiplier=1.0, context_modifier_word=None):
         """Dispatches non-blocking IPC commands to the sandboxed audio hardware worker process.
@@ -198,15 +208,15 @@ class AudioManager:
             return False
 
         target_base_volume = self.volume_history.get(_base_keyword(keyword), 0.5)
-        effective_volume = max(0.0, min(1.0, target_base_volume * context_volume_multiplier))
-        print(f"🎚️  '{keyword}': base_volume={target_base_volume:.3f} x context_multiplier={context_volume_multiplier:.3f} = effective_volume={effective_volume:.3f} (sent to worker, before master scale)")
+        send_volume = effective_volume(target_base_volume, context_volume_multiplier)
+        print(f"🎚️  '{keyword}': base_volume={target_base_volume:.3f} x context_multiplier={context_volume_multiplier:.3f} = effective_volume={send_volume:.3f} (sent to worker, before master scale)")
 
         # FIX: Extract duration via high-performance structural binary scraping instead of Pygame init!
         duration_seconds = get_audio_file_duration(file_path) if periodic_interval is None else periodic_interval
         start_time = time.time()
 
         if periodic_interval is not None:
-            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": effective_volume})
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": send_volume})
             self.active_sounds[keyword] = {"base_volume": target_base_volume, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": False, "is_periodic": True, "duration": periodic_interval, "start_time": start_time}
             on_ui_refresh_callback()
             self.schedule_next_periodic_pass(keyword, file_info, periodic_interval, on_ui_refresh_callback, root_window_widget)
@@ -217,7 +227,7 @@ class AudioManager:
                 try: root_window_widget.after_cancel(self.one_shot_timers[keyword])
                 except Exception: pass
 
-            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": effective_volume})
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": True, "base_volume": send_volume})
             self.active_sounds[keyword] = {"base_volume": target_base_volume, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": True, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
             on_ui_refresh_callback()
 
@@ -225,7 +235,7 @@ class AudioManager:
             task_id = root_window_widget.after(duration_ms, lambda: self.auto_clear_expired_one_shot(keyword, on_ui_refresh_callback))
             self.one_shot_timers[keyword] = task_id
         else:
-            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": False, "base_volume": effective_volume})
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_path, "one_shot": False, "base_volume": send_volume})
             self.active_sounds[keyword] = {"base_volume": target_base_volume, "context_volume_multiplier": context_volume_multiplier, "context_modifier_word": context_modifier_word, "is_one_shot": False, "is_periodic": False, "duration": duration_seconds, "start_time": start_time}
             on_ui_refresh_callback()
         return True
@@ -240,8 +250,8 @@ class AudioManager:
         if keyword not in self.active_sounds: return
         if os.path.exists(file_info["file_path"]):
             entry = self.active_sounds[keyword]
-            effective_volume = max(0.0, min(1.0, entry["base_volume"] * entry.get("context_volume_multiplier", 1.0)))
-            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_info["file_path"], "one_shot": True, "base_volume": effective_volume})
+            send_volume = effective_volume(entry["base_volume"], entry.get("context_volume_multiplier", 1.0))
+            self.command_queue.put({"action": "play", "keyword": keyword, "file_path": file_info["file_path"], "one_shot": True, "base_volume": send_volume})
             entry["start_time"] = time.time()
         self.schedule_next_periodic_pass(keyword, file_info, interval, callback, root)
 
@@ -258,8 +268,7 @@ class AudioManager:
                 # Include context_volume_multiplier so the "Live Output" bar reflects what's
                 # actually playing, not just the slider baseline - a "faint" explosion should
                 # visibly show as quieter than its slider position suggests, not just sound it.
-                effective = sound_data["base_volume"] * sound_data.get("context_volume_multiplier", 1.0)
-                scaled_percentage = int(max(0.0, min(1.0, effective)) * self.master_scale * 100)
+                scaled_percentage = int(effective_volume(sound_data["base_volume"], sound_data.get("context_volume_multiplier", 1.0)) * self.master_scale * 100)
                 sound_data["visual_bar_widget"].config(value=scaled_percentage)
 
     def update_individual_volume(self, keyword, val):
@@ -275,12 +284,18 @@ class AudioManager:
                 scaled_percentage = int(base_vol_float * self.master_scale * 100)
                 self.active_sounds[keyword]["visual_bar_widget"].config(value=scaled_percentage)
 
+    def _save_volume_history(self):
+        try:
+            with open(HISTORY_FILE, "w") as f:
+                json.dump(self.volume_history, f, indent=2)
+        except Exception:
+            print("\n[ERROR-AUDIO-HISTORY] Could not save history file:", file=sys.stderr)
+            traceback.print_exc()
+
     def stop_track_with_gui_sync(self, keyword, callback, fade_ms=1000):
         if keyword in self.active_sounds:
             self.volume_history[_base_keyword(keyword)] = self.active_sounds[keyword]["base_volume"]
-            try:
-                with open(HISTORY_FILE, "w") as f: json.dump(self.volume_history, f, indent=2)
-            except Exception: pass
+            self._save_volume_history()
 
             if keyword in self.periodic_loops: del self.periodic_loops[keyword]
             if keyword in self.one_shot_timers: del self.one_shot_timers[keyword]
@@ -294,14 +309,15 @@ class AudioManager:
     def stop_all_sounds_with_fade(self, save_history_callback, fade_ms=3000):
         for keyword, sound_data in self.active_sounds.items():
             self.volume_history[_base_keyword(keyword)] = sound_data["base_volume"]
-        try:
-            with open(HISTORY_FILE, "w") as f: json.dump(self.volume_history, f, indent=2)
-        except Exception: pass
+        self._save_volume_history()
 
         self.periodic_loops.clear()
         self.one_shot_timers.clear()
         self.command_queue.put({"action": "stop_all", "fade_ms": fade_ms})
         self.active_sounds.clear()
         if save_history_callback:
-            try: save_history_callback()
-            except Exception: pass
+            try:
+                save_history_callback()
+            except Exception:
+                print("\n[ERROR-AUDIO-CALLBACK] save_history_callback failed:", file=sys.stderr)
+                traceback.print_exc()

@@ -36,3 +36,11 @@ def load_keywords():
 def calculate_gains(base_volume, master_scale):
     """Encapsulates relative volume trimming calculation math for safety validation operations."""
     return round(float(base_volume) * float(master_scale), 2)
+
+def effective_volume(base_volume, context_volume_multiplier=1.0):
+    """Clamped base_volume x context_volume_multiplier - the single source of truth for "what
+    should the DM actually hear right now". Used everywhere a sound's real playback level needs
+    computing: dispatch to the audio worker, periodic re-fires, and the UI's progress bars. Kept
+    in one place so a manual slider drag, a "faint"/"massive" auto-adjustment, and the on-screen
+    meter can never quietly disagree about the same number."""
+    return max(0.0, min(1.0, float(base_volume) * float(context_volume_multiplier)))

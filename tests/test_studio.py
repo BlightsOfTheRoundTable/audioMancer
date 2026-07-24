@@ -353,6 +353,34 @@ def test_save_edit_flow_replaces_underlying_file(controller, isolated_paths, tmp
     assert (sounds_dir / "new_storm.wav").exists()  # new file copied in
 
 
+def test_save_edit_flow_survives_and_logs_when_old_file_cannot_be_removed(controller, isolated_paths, tmp_path, capsys):
+    """Regression test: the old-file cleanup during a replace-underlying-file edit used to
+    swallow any failure with a bare `except: pass` - no log, no trace. The new file has
+    already copied successfully at that point, so the edit must still go through (no "Save
+    Failure" dialog), but the failure must now be logged instead of vanishing silently."""
+    sounds_dir, config_path = isolated_paths
+    old_file = sounds_dir / "old_rain"
+    old_file.mkdir()  # a directory in place of the expected file - os.remove() will raise
+    config_path.write_text(json.dumps({str(old_file): ["rain"]}))
+
+    new_source = tmp_path / "new_storm.wav"
+    new_source.write_bytes(b"new audio bytes")
+
+    controller.load_asset_into_form(str(old_file), ["rain"])
+    controller.selected_file_path = str(new_source)
+    _set_keywords(controller, "storm")
+    controller.loop_var.set(True)
+
+    controller.save()  # must not raise
+
+    config = _read_config(config_path)
+    assert config == {str(sounds_dir / "new_storm.wav"): ["storm"]}  # edit still succeeded
+    assert old_file.is_dir()  # cleanup failed, left behind
+
+    captured = capsys.readouterr()
+    assert "[ERROR-STUDIO-CLEANUP]" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # save() - filename collisions
 # ---------------------------------------------------------------------------
