@@ -11,16 +11,12 @@ from dm_mixer import speech as speech_module
 # Test doubles
 # ---------------------------------------------------------------------------
 
-class FakeSegment:
-    def __init__(self, text):
-        self.text = text
+class FakeSpeechRecognizer:
+    """Stands in for stt.SpeechRecognizer - no real model load, no real audio analysis.
+    Tests pre-program what transcribed text comes back from each transcribe() call."""
 
-
-class FakeWhisperModel:
-    """Stands in for faster_whisper.WhisperModel - no real model load, no real audio
-    analysis. Tests pre-program what "transcript" comes back from each call."""
-
-    def __init__(self):
+    def __init__(self, model_size=None):
+        self.model_size = model_size or "base"
         self.responses = []  # list of list[str], consumed FIFO, one list per transcribe() call
         self.calls = 0
 
@@ -29,8 +25,7 @@ class FakeWhisperModel:
 
     def transcribe(self, _audio_buffer, **_kwargs):
         self.calls += 1
-        texts = self.responses.pop(0) if self.responses else []
-        return ([FakeSegment(t) for t in texts], None)
+        return self.responses.pop(0) if self.responses else []
 
 
 class FakeAudioManager:
@@ -96,8 +91,8 @@ def _wait_until(condition, timeout=2.0, interval=0.01):
 @pytest.fixture
 def engine_factory(monkeypatch):
     def _make(keyword_mapping):
-        model = FakeWhisperModel()
-        monkeypatch.setattr(speech_module, "WhisperModel", lambda *a, **kw: model)
+        model = FakeSpeechRecognizer()
+        monkeypatch.setattr(speech_module, "SpeechRecognizer", lambda *a, **kw: model)
 
         audio_manager = FakeAudioManager()
         engine = speech_module.TranscriptionEngine(audio_manager, on_keyword_triggered_callback=lambda: None)

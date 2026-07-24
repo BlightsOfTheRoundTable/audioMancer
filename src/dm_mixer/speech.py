@@ -7,9 +7,9 @@ import random
 import time
 import numpy as np
 import sounddevice as sd
-from faster_whisper import WhisperModel
 
 from dm_mixer import context_analysis
+from dm_mixer.stt import SpeechRecognizer, resolve_model_size
 
 
 def _describe_trigger(keyword, fire_count=1, periodic_seconds=None, volume_multiplier=1.0, volume_modifier_word=None):
@@ -48,8 +48,9 @@ class TranscriptionEngine:
         self.min_buffer_seconds = 3.5
         self.buffer_reset_seconds = 7.0
 
-        print("[LOADING] Loading Whisper model into memory... (This takes a moment)")
-        self.model = WhisperModel("base", device="cpu", compute_type="int8")
+        model_size = resolve_model_size()
+        print(f"[LOADING] Loading Whisper model ({model_size}) into memory... (This takes a moment)")
+        self.recognizer = SpeechRecognizer(model_size=model_size)
 
         print("[LOADING] Loading spaCy language model for context analysis...")
         context_analysis.get_nlp()
@@ -129,13 +130,12 @@ class TranscriptionEngine:
                 
                 if len(audio_buffer) >= self.whisper_target_rate * self.min_buffer_seconds:
                     try:
-                        segments, _ = self.model.transcribe(audio_buffer, beam_size=3, vad_filter=True, language="en")
-                        segments = list(segments)
+                        texts = self.recognizer.transcribe(audio_buffer)
                     except Exception: continue
-                    
-                    for segment in segments:
-                        clean_text = segment.text.lower().strip()
-                        print(f"\rHearing description: {segment.text.strip()}", end="", flush=True)
+
+                    for text in texts:
+                        clean_text = text.lower().strip()
+                        print(f"\rHearing description: {text.strip()}", end="", flush=True)
 
                         # One spaCy parse per chunk, reused for every keyword checked against it -
                         # much cheaper than re-parsing the same sentence once per keyword.
